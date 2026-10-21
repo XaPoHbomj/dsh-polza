@@ -1,6 +1,6 @@
 {
   "name": "dsh-polza",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Polza.ai balance and spend statistics for DeepSeek Harness",
   "type": "module",
   "main": "src/host/index.js",
