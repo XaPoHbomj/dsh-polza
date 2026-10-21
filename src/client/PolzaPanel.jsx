@@ -5,7 +5,7 @@ import {
   amount, balanceTone, costLineLabel, money, periodLabel, preciseMoney,
   shortDate, statusLabel, timestamp, typeLabel, unitLabel,
 } from './format.js'
-import { useAsync, useRefreshTick } from './hooks.js'
+import { useAsync, useCachedAsync, useRefreshTick } from './hooks.js'
 
 /** Hover detail cache, bounded so a long session cannot grow it without limit. */
 const detailCache = new Map()
@@ -41,9 +41,9 @@ export function PolzaPanelIcon({ size = 16, active = false }) {
 /** Always-visible balance chip in the sidebar footer. */
 export function BalanceChip({ wide = true, openPanel }) {
   const [healthTick] = useRefreshTick(300)
-  const health = useAsync(() => api.health(), [healthTick])
+  const health = useAsync(signal => api.health({ signal }), [healthTick])
   const [tick] = useRefreshTick(health.data?.config?.refreshSeconds ?? 60)
-  const summary = useAsync(() => api.summary(), [tick])
+  const summary = useAsync(signal => api.summary({ signal }), [tick])
 
   const balance = summary.data?.balance ?? null
   const available = balance?.available
@@ -343,6 +343,8 @@ function GenerationsTable({ data, loading, error, page, limit, sortBy, sortOrder
             ? `${amount((meta.page - 1) * meta.limit + 1)}–${amount(Math.min(meta.page * meta.limit, meta.total))} из ${amount(meta.total)}`
             : 'Нет записей'}
           {data?.partial ? ' · частично' : ''}
+          {data?.cache?.source === 'disk' ? ' · из кэша' : ''}
+          {loading ? ' · обновляем…' : ''}
         </span>
         <div className="polza-pager">
           <button type="button" className="polza-button" disabled={meta.page <= 1 || loading} onClick={() => onPage(meta.page - 1)}>Назад</button>
@@ -387,16 +389,22 @@ export function PolzaPanel() {
   const [sortBy, setSortBy] = useState('createdAt')
   const [sortOrder, setSortOrder] = useState('desc')
   const [healthTick] = useRefreshTick(300)
-  const health = useAsync(() => api.health(), [healthTick])
+  const health = useAsync(signal => api.health({ signal }), [healthTick])
   const [tick, refresh] = useRefreshTick(health.data?.config?.refreshSeconds ?? 60)
-  const modelOptions = useAsync(() => api.models(), [tick])
-  const overview = useAsync(
-    () => api.overview({ period, requestType, status, model }),
+  const modelOptions = useAsync(signal => api.models({ signal }), [tick])
+  const scopeKey = `${period}|${requestType}|${status}|${model}`
+  const tableKey = `${scopeKey}|${page}|${limit}|${sortBy}|${sortOrder}`
+  const overview = useCachedAsync(
+    signal => api.overview({ period, requestType, status, model, cache: '1' }, { signal }),
+    signal => api.overview({ period, requestType, status, model, fresh: '1' }, { signal }),
     [period, requestType, status, model, tick],
+    scopeKey,
   )
-  const table = useAsync(
-    () => api.generations({ period, requestType, status, model, page, limit, sortBy, sortOrder }),
+  const table = useCachedAsync(
+    signal => api.generations({ period, requestType, status, model, page, limit, sortBy, sortOrder, cache: '1' }, { signal }),
+    signal => api.generations({ period, requestType, status, model, page, limit, sortBy, sortOrder }, { signal }),
     [period, requestType, status, model, page, limit, sortBy, sortOrder, tick],
+    tableKey,
   )
 
   useEffect(() => { setPage(1) }, [period, requestType, status, model, limit, sortBy, sortOrder])
@@ -435,16 +443,25 @@ export function PolzaPanel() {
             ? 'точно за месяц'
             : 'точно за всё время')
 
-  const modelsForFilter = (modelOptions.data?.items ?? [])
+  // `/models` does one cold page-1 read and can take seconds. The overview
+  // already carries the models for the selected period, so the filter can
+  // populate from that immediately and be replaced by the full list later.
+  const modelSource = modelOptions.data?.items?.length
+    ? modelOptions.data.items
+    : (overview.data?.models ?? [])
+  const modelsForFilter = modelSource
     .filter(item => item.key !== 'other')
     .map(item => ({ value: item.key, label: item.label }))
   if (model !== '' && !modelsForFilter.some(item => item.value === model)) {
     modelsForFilter.unshift({ value: model, label: model })
   }
 
+  const busy = overview.loading || table.loading
+
   return (
     <div className="polza-page">
       <div className="polza-inner">
+        <div className="polza-progress" data-active={busy ? 'true' : 'false'} aria-hidden={busy ? 'false' : 'true'} />
         <div className="polza-head">
           <div>
             <h1 className="polza-title">Polza</h1>
@@ -455,6 +472,12 @@ export function PolzaPanel() {
             </p>
           </div>
           <div className="polza-head-actions">
+            {overview.loading ? (
+              <span className="polza-sync">
+                <span className="polza-spinner" aria-hidden="true" />
+                {overview.stale ? 'Показываем кэш, обновляем…' : 'Обновляем данные…'}
+              </span>
+            ) : null}
             <button type="button" className="polza-button" onClick={refreshNow} disabled={overview.loading}>
               {overview.loading ? 'Обновление…' : 'Обновить'}
             </button>

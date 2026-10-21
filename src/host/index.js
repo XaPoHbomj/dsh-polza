@@ -147,8 +147,24 @@ function isLoopback(address) {
  * Fetch pages of history up to the configured cap, optionally narrowing to one
  * model. Polza has no model query parameter, so that filter folds here.
  */
-async function fetchHistory(client, options, cache) {
+function matchesFilters(row, { requestType, status, model }) {
+  if (requestType !== undefined && row.requestType !== requestType) return false
+  if (status !== undefined && row.status !== status) return false
+  if (model !== undefined && row.model !== model && row.modelDisplayName !== model) return false
+  return true
+}
+
+/**
+ * Read one period from the disk cache and/or Polza. `cacheOnly` never touches
+ * the network; it is the first phase that lets the panel paint immediately.
+ * `flight` collapses concurrent page-1 requests for the same query.
+ */
+async function fetchHistory(client, options, cache, control = {}) {
   const { from, to, requestType, status, model, maxPages } = options
+  const cacheOnly = control.cacheOnly === true
+  const flight = control.flight
+  const filters = { requestType, status, model }
+  const filterRows = rows => rows.filter(row => matchesFilters(row, filters))
   const params = page => ({
     page,
     limit: 100,
@@ -159,74 +175,109 @@ async function fetchHistory(client, options, cache) {
     sortBy: 'createdAt',
     sortOrder: 'desc',
   })
+  const queryKey = `${from === null ? 'all' : String(from).slice(0, 10)}|${String(to).slice(0, 10)}|${requestType ?? ''}|${status ?? ''}|${model ?? ''}`
 
-  const first = await client.generations(params(1))
-  const meta = first?.meta ?? null
-  const reportedPages = Number(first?.meta?.totalPages) > 0 ? Number(first.meta.totalPages) : 1
   const fingerprint = await client.fingerprint()
   const store = await cache.open(fingerprint)
-  const queryKey = `${from === null ? 'all' : String(from).slice(0, 10)}|${String(to).slice(0, 10)}|${requestType ?? ''}|${status ?? ''}`
+  const marker = cache.query(store, queryKey)
+  const markerFresh = marker !== undefined
+    && Number(marker.maxPages ?? 0) >= maxPages
+    && Date.now() - Number(marker.at ?? 0) < 24 * 60 * 60 * 1000
+  const markerComplete = markerFresh && (marker.ended === true || Number(marker.actualTotal ?? 0) > Number(marker.total ?? 0))
+  let cacheRows = filterRows(cache.rowsInRange(store, from, to))
+  let coverage = filterRows(cache.rowsInRange(store, from, to, true)).length
 
+  if (cacheOnly) {
+    const expected = Number(marker?.total ?? 0)
+    const needed = expected > 0 ? Math.min(expected, maxPages * 100) : 0
+    const tolerance = Math.min(100, Math.floor(needed * 0.05))
+    const approximatelyCovered = needed > 0 && coverage >= needed - tolerance
+    const total = Math.max(Number(marker?.actualTotal ?? 0), cacheRows.length)
+    return {
+      rows: cacheRows,
+      scanned: cacheRows.length,
+      total,
+      pages: 0,
+      totalPages: Math.max(1, Math.ceil(total / 100)),
+      partial: !(markerComplete || approximatelyCovered),
+      cached: cacheRows.length > 0,
+      meta: null,
+    }
+  }
+
+  // Collapse the entire scan, not just page 1. Several panel mounts asking for
+  // the same period must share one 146-page walk instead of starting five.
+  if (flight !== undefined && control.direct !== true) {
+    const scanKey = `history:${queryKey}:${maxPages}`
+    return await flight(scanKey, () => fetchHistory(client, options, cache, { ...control, direct: true }))
+  }
+
+  const first = flight !== undefined
+    ? await flight(`page1:${queryKey}`, () => client.generations(params(1)))
+    : await client.generations(params(1))
+  const meta = first?.meta ?? null
+  const reportedPages = Number(first?.meta?.totalPages) > 0 ? Number(first.meta.totalPages) : 1
   const firstItems = Array.isArray(first?.items) ? first.items : []
   cache.merge(store, firstItems.map(item => normalizeGeneration(item)))
 
   const expectedTotal = Number(meta?.total) > 0 ? Number(meta.total) : 0
   const needed = expectedTotal > 0 ? Math.min(expectedTotal, maxPages * 100) : 0
-  let rows = cache.rowsInRange(store, from, to)
-  let coverage = cache.rowsInRange(store, from, to, true).length
+  let rows = filterRows(cache.rowsInRange(store, from, to))
+  coverage = filterRows(cache.rowsInRange(store, from, to, true)).length
   let pagesFetched = 1
   let failedPages = 0
   let reachedEnd = firstItems.length < 100
 
-  // A completed query marker is stronger than a row count: the previous scan
-  // may have hit the page cap or covered a wider range. One fresh page still
-  // picks up new generations; the rest of the range is already local.
-  const marker = cache.query(store, queryKey)
-  const markerFresh = marker !== undefined
-    && Number(marker.maxPages ?? 0) >= maxPages
-    && Date.now() - Number(marker.at ?? 0) < 24 * 60 * 60 * 1000
-  // One page of slack absorbs the page cap, a pending row, or a boundary row.
-  // Re-scanning a hundred pages to recover a handful of rows is the worse trade.
   const tolerance = Math.min(100, Math.floor(needed * 0.05))
   const approximatelyCovered = needed > 0 && coverage >= needed - tolerance
-  const markerComplete = markerFresh && (marker.ended === true || Number(marker.actualTotal ?? 0) > Number(marker.total ?? 0))
-  // `meta.totalPages` stops at 100 while pages beyond it can still hold rows.
-  // Until one scan has actually reached the end, a larger page budget must be
-  // spent even when the cached row count already equals the reported total.
   const capUnresolved = reportedPages >= 100 && maxPages > 100 && !markerComplete
+  const willFetch = needed === 0 || capUnresolved || (!markerFresh && !approximatelyCovered)
+  const cacheSufficient = markerFresh && !capUnresolved
+  const batchSize = cacheSufficient ? 2 : 8
+  const resumePage = capUnresolved && coverage >= needed
+    ? Math.max(2, Math.floor(needed / 100) + 1)
+    : 2
 
-  if (needed === 0 || capUnresolved || (!markerFresh && !approximatelyCovered)) {
+  if (willFetch) {
     // Polza caps `meta.totalPages` at 100 even when more rows exist, so pages
     // are read until a short or empty page rather than trusting that field.
-    let nextPage = 2
+    // A verified cache only needs a thin refresh, so its request concurrency
+    // drops. A cold cache, or one whose end is still unconfirmed, keeps 8.
+    // When 10 000 rows are already present and only the page-cap tail is
+    // unresolved, start at page 101 instead of walking the whole range again.
+    let nextPage = resumePage
     while (nextPage <= maxPages && !reachedEnd) {
       const batch = []
-      for (let index = 0; index < 8 && nextPage <= maxPages; index += 1) {
+      for (let index = 0; index < batchSize && nextPage <= maxPages; index += 1) {
         batch.push(nextPage)
         nextPage += 1
       }
       const results = await Promise.allSettled(batch.map(page => client.generations(params(page))))
+      let batchItems = 0
+      let batchFailed = 0
       for (const result of results) {
         if (result.status === 'rejected') {
           failedPages += 1
+          batchFailed += 1
           continue
         }
-        const batchItems = Array.isArray(result.value?.items) ? result.value.items : []
-        if (batchItems.length === 0) {
+        const items = Array.isArray(result.value?.items) ? result.value.items : []
+        batchItems += items.length
+        if (items.length === 0) {
           reachedEnd = true
           continue
         }
-        cache.merge(store, batchItems.map(item => normalizeGeneration(item)))
+        cache.merge(store, items.map(item => normalizeGeneration(item)))
         pagesFetched += 1
-        if (batchItems.length < 100) reachedEnd = true
+        if (items.length < 100) reachedEnd = true
       }
     }
-    rows = cache.rowsInRange(store, from, to)
-    coverage = cache.rowsInRange(store, from, to, true).length
+    rows = filterRows(cache.rowsInRange(store, from, to))
+    coverage = filterRows(cache.rowsInRange(store, from, to, true)).length
   }
 
   const actualTotal = rows.length
-  const total = Math.max(expectedTotal, actualTotal)
+  const total = model !== undefined ? actualTotal : Math.max(expectedTotal, actualTotal)
   const partial = markerFresh
     ? Boolean(marker.partial)
     : failedPages > 0
@@ -239,22 +290,20 @@ async function fetchHistory(client, options, cache) {
     totalPages: reportedPages,
     maxPages,
     pages: markerFresh ? Number(marker.pages ?? pagesFetched) : pagesFetched,
-    ended: reachedEnd,
+    // A page-1-only refresh must not erase a previously confirmed end.
+    ended: reachedEnd || (!willFetch && marker?.ended === true),
     partial,
   })
   cache.scheduleSave(fingerprint, store)
 
-  const filtered = model === undefined
-    ? rows
-    : rows.filter(row => row.model === model || row.modelDisplayName === model)
-
   return {
-    rows: filtered,
+    rows,
     scanned: rows.length,
-    total: model === undefined ? total : filtered.length,
+    total,
     pages: pagesFetched,
     totalPages: Math.max(reportedPages, Math.ceil(actualTotal / 100)),
     partial,
+    cached: true,
     meta,
   }
 }
@@ -270,6 +319,7 @@ export function apply(ctx, config) {
   const routePrefix = initial.routePrefix
   const apiKeyRef = initial.apiKeyRef
   const cache = new Map()
+  const flights = new Map()
   const historyCache = new HistoryCache(ctx.logger)
 
   /** Re-read live settings on every request; `Volatile` fields may change in the UI. */
@@ -277,6 +327,27 @@ export function apply(ctx, config) {
 
   function clearCache() {
     cache.clear()
+    // Keep an in-flight history walk joinable. Repeated "Обновить" clicks used
+    // to clear this map and start another 146-page scan while the first one was
+    // still running. Non-history work is safe to restart.
+    for (const key of flights.keys()) {
+      if (!key.startsWith('history:') && !key.startsWith('page1:')) flights.delete(key)
+    }
+  }
+
+  /** One in-flight operation per key, so duplicate callers share the same work. */
+  function once(key, load) {
+    const running = flights.get(key)
+    if (running !== undefined) {
+      return running
+    }
+    const promise = Promise.resolve().then(load)
+    flights.set(key, promise)
+    promise.then(
+      () => flights.delete(key),
+      () => flights.delete(key),
+    )
+    return promise
   }
 
   /** Resolve the configured reference for one operation. */
@@ -309,22 +380,25 @@ export function apply(ctx, config) {
     const hit = cache.get(key)
     const now = Date.now()
     if (hit !== undefined) {
-      if (hit.expires > now) return hit.value
+      if (hit.expires > now) {
+        return hit.value
+      }
       // Stale-while-revalidate: keep the last answer visible and refresh it
       // behind the request instead of blocking the panel on a long history scan.
       if (!hit.refreshing) {
         hit.refreshing = true
-        Promise.resolve()
-          .then(load)
+        once(key, load)
           .then(value => {
-            cache.set(key, { value, expires: Date.now() + ttlMs })
+            cache.set(key, { value, expires: Date.now() + ttlMs, createdAt: Date.now() })
           })
-          .catch(() => { hit.refreshing = false })
+          .catch(() => {
+            hit.refreshing = false
+          })
       }
       return hit.value
     }
-    const value = await load()
-    cache.set(key, { value, expires: Date.now() + ttlMs })
+    const value = await once(key, load)
+    cache.set(key, { value, expires: Date.now() + ttlMs, createdAt: Date.now() })
     if (cache.size > 80) {
       const oldest = cache.keys().next().value
       if (oldest !== undefined) cache.delete(oldest)
@@ -332,7 +406,7 @@ export function apply(ctx, config) {
     return value
   }
 
-  async function loadSummary() {
+  async function loadSummaryUncached() {
     const [balance, keyResult] = await Promise.all([
       client.balance(),
       client.key().then(
@@ -346,6 +420,10 @@ export function apply(ctx, config) {
       keyError: keyResult.error === null ? null : { code: keyResult.error.code, message: keyResult.error.message },
       fetchedAt: new Date().toISOString(),
     }
+  }
+
+  async function loadSummary() {
+    return await cached('summary', 15_000, loadSummaryUncached)
   }
 
   /** Public, value-free configuration and credential facts. */
@@ -395,11 +473,76 @@ export function apply(ctx, config) {
     }
   }
 
+  function buildOverview(summary, history, query, options) {
+    const folded = aggregate(history.rows, {
+      fromDate: query.period.fromDate,
+      toDate: query.period.toDate,
+    })
+    return {
+      ...(summary ?? { balance: null, key: null, keyError: null, fetchedAt: null }),
+      period: query.period,
+      filters: {
+        requestType: query.requestType ?? null,
+        status: query.status ?? null,
+        model: query.model ?? null,
+      },
+      ...folded,
+      exactCost: exactCostFor(query.period.key, summary?.key ?? null),
+      history: {
+        scanned: history.scanned,
+        total: history.total,
+        partial: history.partial,
+        pages: history.pages,
+        totalPages: history.totalPages,
+        maxPages: options.historyMaxPages,
+      },
+    }
+  }
+
   async function handleOverview(params) {
     const options = current()
     const query = readQuery(params)
-    const cacheKey = `overview:${query.period.key}:${query.period.from}:${query.period.to}:${query.requestType}:${query.status}:${query.model}`
-    return await cached(cacheKey, Math.max(300_000, options.refreshSeconds * 1000), async () => {
+    const cacheOnly = params.get('cache') === '1'
+    const forceFresh = params.get('fresh') === '1'
+    const cacheKey = `overview:${query.period.key}:${query.period.fromDate ?? 'all'}:${query.period.toDate}:${query.requestType ?? ''}:${query.status ?? ''}:${query.model ?? ''}:${options.historyMaxPages}`
+
+    if (cacheOnly) {
+      const memory = cache.get(cacheKey)
+      if (memory !== undefined) {
+        return {
+          ...memory.value,
+          cache: {
+            source: 'memory',
+            stale: memory.expires <= Date.now(),
+            cachedAt: new Date(memory.createdAt ?? Date.now()).toISOString(),
+          },
+        }
+      }
+
+      const summaryEntry = cache.get('summary')
+      const summary = summaryEntry?.value ?? null
+      const history = await fetchHistory(client, {
+        from: query.period.from,
+        to: query.period.to,
+        requestType: query.requestType,
+        status: query.status,
+        model: query.model,
+        maxPages: options.historyMaxPages,
+      }, historyCache, { cacheOnly: true })
+      if (history.rows.length === 0) {
+        return { cache: { source: 'none' } }
+      }
+      return {
+        ...buildOverview(summary, history, query, options),
+        cache: {
+          source: 'disk',
+          cachedAt: summary?.fetchedAt ?? null,
+        },
+      }
+    }
+
+    if (forceFresh) cache.delete(cacheKey)
+    return await cached(cacheKey, Math.max(60_000, options.refreshSeconds * 1000), async () => {
       const [summary, history] = await Promise.all([
         loadSummary(),
         fetchHistory(client, {
@@ -409,30 +552,11 @@ export function apply(ctx, config) {
           status: query.status,
           model: query.model,
           maxPages: options.historyMaxPages,
-        }, historyCache),
+        }, historyCache, { flight: once }),
       ])
-      const folded = aggregate(history.rows, {
-        fromDate: query.period.fromDate,
-        toDate: query.period.toDate,
-      })
       return {
-        ...summary,
-        period: query.period,
-        filters: {
-          requestType: query.requestType ?? null,
-          status: query.status ?? null,
-          model: query.model ?? null,
-        },
-        ...folded,
-        exactCost: exactCostFor(query.period.key, summary.key),
-        history: {
-          scanned: history.scanned,
-          total: history.total,
-          partial: history.partial,
-          pages: history.pages,
-          totalPages: history.totalPages,
-          maxPages: options.historyMaxPages,
-        },
+        ...buildOverview(summary, history, query, options),
+        cache: { source: 'live', cachedAt: new Date().toISOString() },
       }
     })
   }
@@ -445,7 +569,7 @@ export function apply(ctx, config) {
         from: period.from,
         to: period.to,
         maxPages: Math.min(options.historyMaxPages, 10),
-      }, historyCache)
+      }, historyCache, { flight: once })
       const seen = new Map()
       for (const row of history.rows) {
         const entry = seen.get(row.model) ?? {
@@ -473,6 +597,51 @@ export function apply(ctx, config) {
     const limit = readInt(params, 'limit', 25, 1, 100)
     const sortBy = readString(params, 'sortBy', 24) === 'clientCost' ? 'clientCost' : 'createdAt'
     const sortOrder = readString(params, 'sortOrder', 8) === 'asc' ? 'asc' : 'desc'
+    const cacheFirst = params.get('cache') === '1'
+
+    const pageOf = (rows, source, partial) => {
+      const sorted = [...rows].sort((a, b) => {
+        const left = sortBy === 'clientCost' ? a.cost : Date.parse(a.createdAt ?? '')
+        const right = sortBy === 'clientCost' ? b.cost : Date.parse(b.createdAt ?? '')
+        return (Number.isFinite(left) ? left : 0) - (Number.isFinite(right) ? right : 0)
+      })
+      if (sortOrder === 'desc') sorted.reverse()
+      const start = (page - 1) * limit
+      const items = sorted.slice(start, start + limit)
+      return {
+        items,
+        meta: {
+          page,
+          limit,
+          total: sorted.length,
+          totalPages: Math.max(1, Math.ceil(sorted.length / limit)),
+        },
+        partial,
+        cache: { source },
+        fetchedAt: new Date().toISOString(),
+      }
+    }
+
+    if (cacheFirst) {
+      const history = await fetchHistory(client, {
+        from: query.period.from,
+        to: query.period.to,
+        requestType: query.requestType,
+        status: query.status,
+        model: query.model,
+        maxPages: options.historyMaxPages,
+      }, historyCache, { cacheOnly: true })
+      if (history.rows.length === 0) {
+        return {
+          items: [],
+          meta: { page, limit, total: 0, totalPages: 1 },
+          partial: true,
+          cache: { source: 'none' },
+          fetchedAt: new Date().toISOString(),
+        }
+      }
+      return pageOf(history.rows, 'disk', history.partial)
+    }
 
     if (query.model !== undefined) {
       const history = await fetchHistory(client, {
@@ -482,22 +651,12 @@ export function apply(ctx, config) {
         status: query.status,
         model: query.model,
         maxPages: options.historyMaxPages,
-      }, historyCache)
-      const start = (page - 1) * limit
-      return {
-        items: history.rows.slice(start, start + limit),
-        meta: {
-          page,
-          limit,
-          total: history.rows.length,
-          totalPages: Math.max(1, Math.ceil(history.rows.length / limit)),
-        },
-        partial: history.partial,
-        fetchedAt: new Date().toISOString(),
-      }
+      }, historyCache, { flight: once })
+      return pageOf(history.rows, 'cache', history.partial)
     }
 
-    const data = await client.generations({
+    const flightKey = `generations:${query.period.fromDate ?? 'all'}:${query.period.toDate}:${query.requestType ?? ''}:${query.status ?? ''}:${page}:${limit}:${sortBy}:${sortOrder}`
+    const data = await once(flightKey, () => client.generations({
       page,
       limit,
       dateFrom: query.period.from ?? undefined,
@@ -506,7 +665,7 @@ export function apply(ctx, config) {
       status: query.status,
       sortBy,
       sortOrder,
-    })
+    }))
     const items = (Array.isArray(data?.items) ? data.items : []).map(item => normalizeGeneration(item))
     const reportedTotal = Number(data?.meta?.total) || 0
     const reportedPages = Number(data?.meta?.totalPages) || 1
@@ -524,6 +683,7 @@ export function apply(ctx, config) {
         totalPages: Math.max(reportedPages, page + (hasMore ? 1 : 0)),
       },
       partial: false,
+      cache: { source: 'api' },
       fetchedAt: new Date().toISOString(),
     }
   }
@@ -566,8 +726,7 @@ export function apply(ctx, config) {
         return
       }
       if (path === '/summary') {
-        const summary = await cached('summary', 15_000, loadSummary)
-        sendJson(res, 200, summary)
+        sendJson(res, 200, await loadSummary())
         return
       }
       if (path === '/overview') {

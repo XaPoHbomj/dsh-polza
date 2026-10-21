@@ -83,22 +83,35 @@ export class HistoryCache {
     this.root = cacheRoot()
     this.stores = new Map()
     this.saves = new Map()
+    this.loading = new Map()
   }
 
   /** Load (once) and return one fingerprint's store. */
   async open(fingerprint) {
     if (this.stores.has(fingerprint)) return this.stores.get(fingerprint)
-    let store
+    const running = this.loading.get(fingerprint)
+    if (running !== undefined) return running
+
+    // Concurrent panel routes used to parse the same 6.5 MB file three times.
+    const pending = (async () => {
+      let store
+      try {
+        await mkdir(this.root, { recursive: true, mode: 0o700 })
+        store = await loadStore(join(this.root, `${fingerprint}.json`))
+      } catch (error) {
+        this.logger?.warn?.(`dsh-polza: history cache unavailable: ${error instanceof Error ? error.message : String(error)}`)
+        store = new Store()
+        store.loadedAt = Date.now()
+      }
+      this.stores.set(fingerprint, store)
+      return store
+    })()
+    this.loading.set(fingerprint, pending)
     try {
-      await mkdir(this.root, { recursive: true, mode: 0o700 })
-      store = await loadStore(join(this.root, `${fingerprint}.json`))
-    } catch (error) {
-      this.logger?.warn?.(`dsh-polza: history cache unavailable: ${error instanceof Error ? error.message : String(error)}`)
-      store = new Store()
-      store.loadedAt = Date.now()
+      return await pending
+    } finally {
+      if (this.loading.get(fingerprint) === pending) this.loading.delete(fingerprint)
     }
-    this.stores.set(fingerprint, store)
-    return store
   }
 
   /** Merge rows into a store, keeping the newest value for one id. */

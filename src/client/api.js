@@ -14,12 +14,14 @@ function query(params) {
 }
 
 /** One JSON request with the host's normalized error vocabulary. */
-async function request(path, params) {
-  const response = await fetch(`${BASE}${path}${query(params)}`, {
+async function request(path, params, options = {}) {
+  const url = `${BASE}${path}${query(params)}`
+  const response = await fetch(url, {
     method: 'GET',
     headers: { Accept: 'application/json' },
     credentials: 'same-origin',
     cache: 'no-store',
+    signal: options.signal,
   })
   let body
   try {
@@ -38,11 +40,11 @@ async function request(path, params) {
 }
 
 export const api = {
-  health: () => request('/health'),
-  refresh: () => request('/refresh'),
-  summary: () => request('/summary'),
-  models: () => request('/models'),
-  overview: params => request('/overview', params),
-  generations: params => request('/generations', params),
-  generation: id => request('/generation', { id }),
+  health: options => request('/health', undefined, options),
+  refresh: options => request('/refresh', undefined, options),
+  summary: options => request('/summary', undefined, options),
+  models: options => request('/models', undefined, options),
+  overview: (params, options) => request('/overview', params, options),
+  generations: (params, options) => request('/generations', params, options),
+  generation: (id, options) => request('/generation', { id }, options),
 }

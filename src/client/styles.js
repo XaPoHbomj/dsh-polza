@@ -231,6 +231,48 @@ const CSS = `
   .polza-cards { grid-template-columns: minmax(0, 1fr); }
   .polza-hide-sm { display: none; }
 }
+/* A visible progress line for long all-time scans; a cached table can stay
+   on screen while this runs, so the page must still look busy. */
+.polza-progress {
+  flex: 0 0 2px;
+  height: 2px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: transparent;
+  opacity: 0;
+  transition: opacity .15s ease;
+}
+.polza-progress[data-active="true"] { opacity: 1; background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.06)); }
+.polza-progress[data-active="true"]::after {
+  content: '';
+  display: block;
+  width: 38%;
+  height: 100%;
+  border-radius: inherit;
+  background: #4d6bfe;
+  animation: polza-progress 1.1s ease-in-out infinite;
+}
+@keyframes polza-progress {
+  0% { transform: translateX(-105%); }
+  100% { transform: translateX(290%); }
+}
+.polza-sync {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dsw-alias-label-secondary, #555);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.polza-spinner {
+  width: 11px;
+  height: 11px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: polza-spin .7s linear infinite;
+}
+@keyframes polza-spin { to { transform: rotate(360deg); } }
 `
 
 /** Inject the stylesheet once. */

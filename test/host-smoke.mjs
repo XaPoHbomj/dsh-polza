@@ -25,6 +25,7 @@ const rows = Array.from({ length: 250 }, (_, index) => ({
   createdAt: new Date(now - index * 60_000).toISOString(),
 }))
 
+let historyPageOneCalls = 0
 globalThis.fetch = async input => {
   const url = new URL(String(input))
   if (url.pathname.endsWith('/v2/balance')) {
@@ -67,6 +68,7 @@ globalThis.fetch = async input => {
   }
   if (url.pathname.endsWith('/v1/history/generations')) {
     const page = Number(url.searchParams.get('page') ?? '1')
+    if (page === 1) historyPageOneCalls += 1
     const limit = Number(url.searchParams.get('limit') ?? '100')
     const start = (page - 1) * limit
     const items = rows.slice(start, start + limit)
@@ -138,7 +140,31 @@ assert.equal(overview.body.balance.available, 90.25)
 assert.ok(overview.body.days.length >= 1)
 assert.ok(overview.body.models.length >= 1)
 
+historyPageOneCalls = 0
+const cacheOnlyOverview = await call('/polza/api/overview?period=week&cache=1')
+assert.equal(historyPageOneCalls, 0, 'cache-only overview must not touch the network')
+assert.equal(cacheOnlyOverview.status, 200)
+assert.equal(cacheOnlyOverview.body.cache.source, 'memory')
+assert.ok(cacheOnlyOverview.body.history.scanned > 0)
+
+const freshOverview = await call('/polza/api/overview?period=week&fresh=1')
+assert.equal(freshOverview.status, 200)
+assert.equal(freshOverview.body.cache.source, 'live')
+
+historyPageOneCalls = 0
+const cacheOnlyTable = await call('/polza/api/generations?period=week&limit=5&page=1&cache=1')
+assert.equal(historyPageOneCalls, 0, 'cache-only table must not touch the network')
+assert.equal(cacheOnlyTable.status, 200)
+assert.equal(cacheOnlyTable.body.cache.source, 'disk')
+assert.equal(cacheOnlyTable.body.items.length, 5)
+
 await call('/polza/api/refresh')
+historyPageOneCalls = 0
+const diskOverview = await call('/polza/api/overview?period=week&cache=1')
+assert.equal(historyPageOneCalls, 0, 'disk cache-only overview must not touch the network')
+assert.equal(diskOverview.status, 200)
+assert.equal(diskOverview.body.cache.source, 'disk')
+assert.ok(diskOverview.body.history.scanned > 0)
 const cachedOverview = await call('/polza/api/overview?period=week')
 assert.equal(cachedOverview.status, 200)
 assert.equal(cachedOverview.body.history.pages, 1, 'second read uses the local history cache')
@@ -157,6 +183,14 @@ assert.equal(detail.body.costLines.length, 3)
 const models = await call('/polza/api/models')
 assert.equal(models.status, 200)
 assert.ok(models.body.items.length >= 1)
+
+historyPageOneCalls = 0
+const concurrent = await Promise.all([
+  call('/polza/api/overview?period=day&fresh=1'),
+  call('/polza/api/overview?period=day&fresh=1'),
+])
+assert.ok(concurrent.every(item => item.status === 200))
+assert.equal(historyPageOneCalls, 1, 'concurrent overviews share one page-1 request')
 
 const forbidden = await call('/polza/api/health')
 assert.equal(forbidden.status, 200)
