@@ -28,7 +28,6 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          registry-url: https://registry.npmjs.org
 
       - name: Use current npm CLI
         run: npm install -g npm@latest
@@ -47,8 +46,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub release
         env:

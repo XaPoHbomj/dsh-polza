@@ -178,11 +178,13 @@ The `release.yml` workflow then:
 3. publishes with `npm publish --provenance --access public`;
 4. creates a GitHub Release for the tag.
 
-The repository needs an `NPM_TOKEN` secret: a granular npm token with publish
-rights for `dsh-polza` (2FA bypass enabled when the account requires it). The
-workflow also requests `id-token: write`; if you switch to npm Trusted
-Publishing, remove the `NODE_AUTH_TOKEN` entry and configure the trusted
-publisher on npmjs.com instead.
+Publishing uses npm **Trusted Publishing** over OIDC: the workflow requests
+`id-token: write` and carries no `NPM_TOKEN`. Configure the package once on
+npmjs.com under Settings → Trusted Publisher → GitHub Actions with
+organization/user `XaPoHbomj`, repository `dsh-polza`, workflow `release.yml`,
+and no environment. If the trusted publisher is unavailable, a granular
+`NPM_TOKEN` can be restored temporarily as `NODE_AUTH_TOKEN` on the publish
+step.
 
 Do not include `_dsh-src/`, `node_modules/`, `test/.tmp/`, or the local
 `.credentials.yaml` in a release. `lib/client.js` is the distributed browser

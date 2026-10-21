@@ -6,14 +6,22 @@
   `package.json`, builds and tests the plugin, publishes to npm with provenance,
   and creates a GitHub Release.
 
-## Required secret
+## npm Trusted Publishing
 
-`release.yml` expects a repository secret named `NPM_TOKEN`: a granular npm
-access token with read/write permission for the `dsh-polza` package (or an
-automation token with 2FA bypass enabled if the account enforces 2FA for
-writes). Add it under **Settings → Secrets and variables → Actions**.
+`release.yml` authenticates to npm through OIDC, not through a stored token.
+Configure the package once on npmjs.com:
 
-An alternative to the token is npm Trusted Publishing: configure the package on
-npmjs.com to trust this repository and the `release.yml` workflow, then remove
-the `NODE_AUTH_TOKEN` environment entry. The workflow already requests the
-`id-token: write` permission needed for OIDC.
+1. Open `https://www.npmjs.com/package/dsh-polza` → **Settings**.
+2. Under **Trusted Publisher**, choose **GitHub Actions**.
+3. Set organization/user to `XaPoHbomj`, repository to `dsh-polza`, workflow
+   filename to `release.yml`, and leave the environment blank.
+4. Save. No `NPM_TOKEN` secret is needed.
+
+The workflow already requests `id-token: write`, which npm exchanges for a
+short-lived publishing credential. `--provenance` attaches a signed provenance
+statement to the published tarball.
+
+If the trusted publisher is not configured, the release job fails at the publish
+step with an authentication error. In that case a granular `NPM_TOKEN` can be
+used temporarily by restoring the `NODE_AUTH_TOKEN` env entry on the publish
+step.

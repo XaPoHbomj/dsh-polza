@@ -194,9 +194,10 @@ git push origin main --follow-tags
 ```
 
 После пуша workflow `Release` проверяет тег, собирает клиент, прогоняет тесты,
-публикует пакет в npm и создаёт GitHub Release. Для публикации нужен секрет
-репозитория `NPM_TOKEN` — granular access token с правом публикации `dsh-polza`.
-Подробности — в [AGENTS.md](AGENTS.md).
+публикует пакет в npm через **Trusted Publishing** (OIDC, без токена) и создаёт
+GitHub Release. Один раз нужно указать в настройках пакета на npmjs.com
+trusted publisher: GitHub Actions, репозиторий `XaPoHbomj/dsh-polza`, workflow
+`release.yml`. Подробности — в [AGENTS.md](AGENTS.md).
 
 ## Лицензия
 
