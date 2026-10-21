@@ -1,0 +1,5 @@
+# dsh-polza bundle layer: one host row over the Web profile. The row also
+# carries the browser half through the package's `dsh.client` declaration.
+- insert:
+    - id: polza
+      name: dsh-polza

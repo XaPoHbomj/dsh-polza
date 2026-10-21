@@ -1,0 +1,8 @@
+_dsh-src/
+node_modules/
+lib/client.js.map
+*.log
+.DS_Store
+test/.tmp/
+.idea/
+.vscode/
