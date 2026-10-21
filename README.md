@@ -178,27 +178,6 @@ Polza отдаёт в `meta.total` и `meta.totalPages` не больше `10 00
 Для истории всего аккаунта нужен JWT личного кабинета, который плагин
 сознательно не использует.
 
-## Релизы
-
-Версия в `package.json`, git-тег `vX.Y.Z` и версия в npm должны совпадать.
-Публикация запускается тегом:
-
-```bash
-npm version patch --no-git-tag-version
-pnpm build
-pnpm test
-git add package.json lib/client.js
-git commit -m "Release v0.1.1"
-git tag -a v0.1.1 -m "v0.1.1"
-git push origin main --follow-tags
-```
-
-После пуша workflow `Release` проверяет тег, собирает клиент, прогоняет тесты,
-публикует пакет в npm через **Trusted Publishing** (OIDC, без токена) и создаёт
-GitHub Release. Один раз нужно указать в настройках пакета на npmjs.com
-trusted publisher: GitHub Actions, репозиторий `XaPoHbomj/dsh-polza`, workflow
-`release.yml`. Подробности — в [AGENTS.md](AGENTS.md).
-
 ## Лицензия
 
 MIT. См. [LICENSE](LICENSE).
