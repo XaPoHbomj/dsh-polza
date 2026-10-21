@@ -38,7 +38,8 @@
   "scripts": {
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
-    "test": "node test/host-smoke.mjs && node test/render.mjs && node test/dom.mjs"
+    "test": "node test/host-smoke.mjs && node test/render.mjs && node test/dom.mjs",
+    "prepublishOnly": "node build.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",
@@ -57,5 +58,19 @@
   "homepage": "https://github.com/XaPoHbomj/dsh-polza#readme",
   "bugs": {
     "url": "https://github.com/XaPoHbomj/dsh-polza/issues"
+  },
+  "author": "Aleksandr Vashchenko",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "polza",
+    "polza-ai",
+    "balance",
+    "usage",
+    "cost"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }
