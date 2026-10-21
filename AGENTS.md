@@ -158,8 +158,32 @@ Check in the Web GUI:
 
 ## Releasing
 
-1. Bump `version` in `package.json`.
-2. Run `pnpm test` and `pnpm build`.
-3. Commit `lib/client.js` (it is the distributed browser artifact).
-4. Tag the release. Do not include `_dsh-src/`, `node_modules/`, or
-   `test/.tmp/`.
+Releases are published from a git tag, never from an uncommitted working tree.
+The npm package is `dsh-polza`; version, tag, and npm must agree.
+
+```bash
+npm version patch --no-git-tag-version
+pnpm build
+pnpm test
+git add package.json lib/client.js
+git commit -m "Release vX.Y.Z"
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin main --follow-tags
+```
+
+The `release.yml` workflow then:
+
+1. verifies that `GITHUB_REF_NAME` equals `v` + the `package.json` version;
+2. installs with the frozen lockfile and runs `pnpm test`;
+3. publishes with `npm publish --provenance --access public`;
+4. creates a GitHub Release for the tag.
+
+The repository needs an `NPM_TOKEN` secret: a granular npm token with publish
+rights for `dsh-polza` (2FA bypass enabled when the account requires it). The
+workflow also requests `id-token: write`; if you switch to npm Trusted
+Publishing, remove the `NODE_AUTH_TOKEN` entry and configure the trusted
+publisher on npmjs.com instead.
+
+Do not include `_dsh-src/`, `node_modules/`, `test/.tmp/`, or the local
+`.credentials.yaml` in a release. `lib/client.js` is the distributed browser
+artifact and must be committed before tagging.

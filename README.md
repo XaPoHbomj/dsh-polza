@@ -1,6 +1,7 @@
 # dsh-polza
 
 [![CI](https://github.com/XaPoHbomj/dsh-polza/actions/workflows/ci.yml/badge.svg)](https://github.com/XaPoHbomj/dsh-polza/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/dsh-polza.svg)](https://www.npmjs.com/package/dsh-polza)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > [!WARNING]
@@ -34,20 +35,33 @@
 
 ## Установка
 
-Из GitHub:
+Из npm:
 
 ```bash
-git clone https://github.com/XaPoHbomj/dsh-polza.git
-dsh plugin --profile web add ./dsh-polza
+dsh plugin --profile web add dsh-polza
 ```
 
-Или из локальной папки:
+Обновление до последней версии:
 
 ```bash
-dsh plugin --profile web add /path/to/dsh-polza
+dsh plugin --profile web add dsh-polza@latest
 ```
 
 Перезапустите `dsh web`. Плагин появится в футере сайдбара и в списке панелей.
+
+Из GitHub — если нужна ветка `main` или конкретный коммит:
+
+```bash
+dsh plugin --profile web add github:XaPoHbomj/dsh-polza
+```
+
+Из локальной папки — для разработки:
+
+```bash
+dsh plugin --profile web add /path/to/dsh-polza
+# или
+dsh plugin --profile web add "link:$PWD"
+```
 
 Для разработки:
 
@@ -163,6 +177,26 @@ Polza отдаёт в `meta.total` и `meta.totalPages` не больше `10 00
 другие ключи, площадку или веб-использование — по API-ключу они недоступны.
 Для истории всего аккаунта нужен JWT личного кабинета, который плагин
 сознательно не использует.
+
+## Релизы
+
+Версия в `package.json`, git-тег `vX.Y.Z` и версия в npm должны совпадать.
+Публикация запускается тегом:
+
+```bash
+npm version patch --no-git-tag-version
+pnpm build
+pnpm test
+git add package.json lib/client.js
+git commit -m "Release v0.1.1"
+git tag -a v0.1.1 -m "v0.1.1"
+git push origin main --follow-tags
+```
+
+После пуша workflow `Release` проверяет тег, собирает клиент, прогоняет тесты,
+публикует пакет в npm и создаёт GitHub Release. Для публикации нужен секрет
+репозитория `NPM_TOKEN` — granular access token с правом публикации `dsh-polza`.
+Подробности — в [AGENTS.md](AGENTS.md).
 
 ## Лицензия
 
