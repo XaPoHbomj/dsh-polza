@@ -1,5 +1,8 @@
 # dsh-polza
 
+[![CI](https://github.com/XaPoHbomj/dsh-polza/actions/workflows/ci.yml/badge.svg)](https://github.com/XaPoHbomj/dsh-polza/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 > [!WARNING]
 > **Неофициальный плагин.** Проект не связан с Polza.ai, DeepSeek или их
 > правообладателями и не поддерживается ими. API Polza может измениться в любой
@@ -30,6 +33,15 @@
 которым пользуется DSH: Polza не отдаёт историю других ключей по API-ключу.
 
 ## Установка
+
+Из GitHub:
+
+```bash
+git clone https://github.com/XaPoHbomj/dsh-polza.git
+dsh plugin --profile web add ./dsh-polza
+```
+
+Или из локальной папки:
 
 ```bash
 dsh plugin --profile web add /path/to/dsh-polza

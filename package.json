@@ -49,5 +49,13 @@
   "license": "MIT",
   "dependencies": {
     "@deepseek-ai/schemastery": "3.18.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XaPoHbomj/dsh-polza.git"
+  },
+  "homepage": "https://github.com/XaPoHbomj/dsh-polza#readme",
+  "bugs": {
+    "url": "https://github.com/XaPoHbomj/dsh-polza/issues"
   }
 }
