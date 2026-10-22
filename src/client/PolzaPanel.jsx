@@ -433,8 +433,11 @@ export function PolzaPanel() {
   const promptTokens = totals?.promptTokens ?? 0
   const cachedTokens = totals?.cachedTokens ?? 0
   const cacheShare = promptTokens > 0 ? Math.round((cachedTokens / promptTokens) * 100) : 0
+  const filtered = Boolean(data?.filters && (data.filters.requestType || data.filters.status || data.filters.model))
   const exactNote = exact === null
-    ? (data?.history?.partial ? `по ${amount(data.history.scanned)} из ${amount(data.history.total)} записей` : 'по истории ключа')
+    ? (data?.history?.partial
+        ? `по ${amount(data.history.scanned)} из ${amount(data.history.total)} записей`
+        : (filtered ? 'по истории с учётом фильтров' : 'по истории ключа'))
     : (exact.source === 'usage_daily'
         ? 'точно за сегодня'
         : exact.source === 'usage_weekly'

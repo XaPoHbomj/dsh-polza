@@ -1,17 +1,27 @@
 /**
  * Local cache of parsed Polza generations. Finished and failed generations are
  * immutable, so a row fetched once can be reused by later period queries; only
- * the newest page is refreshed on each open. The cache lives under the harness
- * home and is keyed by a hash of the API key, never by the key itself.
+ * the newest page is refreshed on each open. `pending` rows are mutable and get
+ * revalidated: a page fetch counts as one check, and rows whose page is no
+ * longer re-read are re-checked by id at a bounded rate. The cache lives under
+ * the harness home and is keyed by a hash of the API key, never by the key
+ * itself.
  */
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 const VERSION = 1
 const MAX_ROWS = 60_000
 const MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000
+
+// A stuck `pending` row is re-checked by id at most this often, and at most
+// this many rows per scan, so a burst of long-running generations cannot turn
+// into a request storm.
+const PENDING_RECHECK_MS = 2 * 60_000
+const PENDING_RECHECK_LIMIT = 25
+const PENDING_CHECKS_MAX = 5_000
 
 /** Stable, non-reversible fingerprint for one resolved API key. */
 export function keyFingerprint(value) {
@@ -31,11 +41,33 @@ function timeOf(row) {
   return Number.isFinite(value) ? value : null
 }
 
+/** Millisecond bounds of one ISO range. */
+function rangeMs(from, to) {
+  return [
+    from === null || from === undefined ? Number.NEGATIVE_INFINITY : Date.parse(from),
+    to === null || to === undefined ? Number.POSITIVE_INFINITY : Date.parse(to),
+  ]
+}
+
+/** Drop oldest pending-check stamps so the map stays bounded. */
+function prunePendingChecks(store) {
+  if (store.pendingChecks.size <= PENDING_CHECKS_MAX) return
+  let excess = store.pendingChecks.size - PENDING_CHECKS_MAX
+  for (const key of store.pendingChecks.keys()) {
+    if (excess <= 0) break
+    store.pendingChecks.delete(key)
+    excess -= 1
+  }
+}
+
 /** One fingerprint's in-memory rows plus persistence metadata. */
 class Store {
   constructor() {
     this.rows = new Map()
     this.queries = new Map()
+    // In-memory only: when each `pending` row was last seen fresh (serialized
+    // stores never carry it, so a restart re-checks pending rows once).
+    this.pendingChecks = new Map()
     this.loadedAt = 0
     this.dirty = false
   }
@@ -83,6 +115,8 @@ export class HistoryCache {
     this.root = cacheRoot()
     this.stores = new Map()
     this.saves = new Map()
+    this.writes = new Map()
+    this.writeSeq = 0
     this.loading = new Map()
   }
 
@@ -117,9 +151,13 @@ export class HistoryCache {
   /** Merge rows into a store, keeping the newest value for one id. */
   merge(store, rows) {
     let changed = false
+    const now = Date.now()
     for (const row of rows) {
       if (row?.id === undefined) continue
       const id = String(row.id)
+      // A freshly fetched `pending` row is as current as a re-check can make
+      // it, so the fetch itself counts as one.
+      if (row.status === 'pending') store.pendingChecks.set(id, now)
       const previous = store.rows.get(id)
       if (
         previous === undefined
@@ -133,21 +171,52 @@ export class HistoryCache {
     }
     if (changed) store.dirty = true
     prune(store)
+    prunePendingChecks(store)
   }
 
-  /** Rows inside one ISO range; pending rows are excluded unless coverage counting asks for them. */
-  rowsInRange(store, from, to, includePending = false) {
-    const fromMs = from === null || from === undefined ? Number.NEGATIVE_INFINITY : Date.parse(from)
-    const toMs = to === null || to === undefined ? Number.POSITIVE_INFINITY : Date.parse(to)
+  /** Rows inside one ISO range, newest first. */
+  rowsInRange(store, from, to) {
+    const [fromMs, toMs] = rangeMs(from, to)
     const rows = []
     for (const row of store.rows.values()) {
-      if (!includePending && row.status === 'pending') continue
       const at = timeOf(row)
       if (at === null || at < fromMs || at > toMs) continue
       rows.push(row)
     }
     rows.sort((a, b) => (timeOf(b) ?? 0) - (timeOf(a) ?? 0))
     return rows
+  }
+
+  /**
+   * Ids of `pending` rows in one range that no page fetch or re-check has
+   * refreshed recently, oldest first. Oldest rows are the most likely to have
+   * finished without their page being re-read.
+   */
+  pendingToRefresh(store, from, to) {
+    const [fromMs, toMs] = rangeMs(from, to)
+    const cutoff = Date.now() - PENDING_RECHECK_MS
+    const rows = []
+    for (const row of store.rows.values()) {
+      if (row.status !== 'pending') continue
+      const at = timeOf(row)
+      if (at === null || at < fromMs || at > toMs) continue
+      if (Number(store.pendingChecks.get(String(row.id)) ?? 0) > cutoff) continue
+      rows.push(row)
+    }
+    rows.sort((a, b) => (timeOf(a) ?? 0) - (timeOf(b) ?? 0))
+    return rows.slice(0, PENDING_RECHECK_LIMIT).map(row => String(row.id))
+  }
+
+  /** Record that one batch of pending rows was re-checked now. */
+  touchPending(store, ids) {
+    const now = Date.now()
+    for (const id of ids) store.pendingChecks.set(String(id), now)
+    prunePendingChecks(store)
+  }
+
+  /** Forget pending-check stamps so the next scan re-checks them at once. */
+  resetPendingChecks() {
+    for (const store of this.stores.values()) store.pendingChecks.clear()
   }
 
   /** One completed page-range marker for a period/filter combination. */
@@ -186,12 +255,29 @@ export class HistoryCache {
     this.saves.set(fingerprint, timer)
   }
 
-  /** Write one store atomically. */
+  /**
+   * Write one store atomically. Writes for one fingerprint are chained, so two
+   * saves can never interleave in the same temporary file.
+   */
   async save(fingerprint, store) {
     if (!store.dirty) return
     store.dirty = false
+    const previous = this.writes.get(fingerprint) ?? Promise.resolve()
+    const task = previous.then(() => this.writeOut(fingerprint, store))
+    const tail = task.catch(() => {})
+    this.writes.set(fingerprint, tail)
+    try {
+      await task
+    } finally {
+      if (this.writes.get(fingerprint) === tail) this.writes.delete(fingerprint)
+    }
+  }
+
+  /** Serialize one store to a unique temporary file, then rename it in place. */
+  async writeOut(fingerprint, store) {
     const file = join(this.root, `${fingerprint}.json`)
-    const temporary = `${file}.${process.pid}.tmp`
+    this.writeSeq += 1
+    const temporary = `${file}.${process.pid}.${this.writeSeq}.tmp`
     const payload = {
       version: VERSION,
       savedAt: new Date().toISOString(),
@@ -204,6 +290,7 @@ export class HistoryCache {
       await rename(temporary, file)
     } catch (error) {
       store.dirty = true
+      await rm(temporary, { force: true }).catch(() => {})
       this.logger?.warn?.(`dsh-polza: history cache write failed: ${error instanceof Error ? error.message : String(error)}`)
     }
   }

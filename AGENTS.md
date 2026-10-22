@@ -106,15 +106,21 @@ build.mjs               esbuild wrapper for the lazy-CJS client bundle
   a plain UTC midnight.
 - Periods: `today`, `week` (Monday), `month`, `all`, plus internal `7d`/`30d`
   and `custom` support. Exact KPI totals use the key rollups where they map to
-  a period; charts and breakdowns fold history rows.
+  a period; charts and breakdowns fold history rows. The exact total is
+  suppressed when request/status/model filters are active, because the key
+  rollups cannot answer a filtered query.
 - Polza caps `meta.total` at 10 000 and `meta.totalPages` at 100. Pages beyond
   100 can still return rows. `fetchHistory` reads until a short or empty page
   (within `historyMaxPages`) and does not trust the reported total page count.
 - The table pagination also keeps “next” available while a full page is
   returned, so it can go past page 100.
 - The local cache assumes **completed and failed generations are immutable**.
-  `pending` rows are re-read. If that assumption is ever wrong for a provider
-  field, bump the cache version or add a revalidation path.
+  `pending` rows are mutable and revalidated: a page fetch counts as one check,
+  and rows whose page is no longer re-read are re-checked by id (at most 25 per
+  scan, at most once per 2 minutes per row); `/refresh` clears that rate limit.
+  Pending rows take part in results and totals like any other row. If the
+  immutability assumption is ever wrong for a provider field, bump the cache
+  version or add a revalidation path.
 
 ## Local cache
 
@@ -127,6 +133,8 @@ build.mjs               esbuild wrapper for the lazy-CJS client bundle
 - A fresh page 1 is always fetched to pick up new rows; older pages come from
   cache. A query marker records that a range was scanned to the end, so repeat
   period switches skip the deep scan.
+- Saves for one fingerprint are chained and each write uses a unique temporary
+  file, so concurrent saves can never interleave into one corrupt payload.
 - Cache failures are non-fatal: the plugin logs a warning and continues.
 
 ## Verification checklist

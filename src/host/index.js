@@ -50,6 +50,9 @@ const DEFAULTS = {
 const KEY_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 const ROUTE_PREFIX_PATTERN = /^\/[A-Za-z0-9/_-]*$/
 
+// Concurrent by-id re-checks of stuck `pending` rows per upstream batch.
+const DETAIL_BATCH = 5
+
 /** Clamp one integer option. */
 function integer(value, fallback, min, max) {
   const number = Number(value)
@@ -185,7 +188,7 @@ async function fetchHistory(client, options, cache, control = {}) {
     && Date.now() - Number(marker.at ?? 0) < 24 * 60 * 60 * 1000
   const markerComplete = markerFresh && (marker.ended === true || Number(marker.actualTotal ?? 0) > Number(marker.total ?? 0))
   let cacheRows = filterRows(cache.rowsInRange(store, from, to))
-  let coverage = filterRows(cache.rowsInRange(store, from, to, true)).length
+  let coverage = cacheRows.length
 
   if (cacheOnly) {
     const expected = Number(marker?.total ?? 0)
@@ -223,7 +226,7 @@ async function fetchHistory(client, options, cache, control = {}) {
   const expectedTotal = Number(meta?.total) > 0 ? Number(meta.total) : 0
   const needed = expectedTotal > 0 ? Math.min(expectedTotal, maxPages * 100) : 0
   let rows = filterRows(cache.rowsInRange(store, from, to))
-  coverage = filterRows(cache.rowsInRange(store, from, to, true)).length
+  coverage = rows.length
   let pagesFetched = 1
   let failedPages = 0
   let reachedEnd = firstItems.length < 100
@@ -273,7 +276,33 @@ async function fetchHistory(client, options, cache, control = {}) {
       }
     }
     rows = filterRows(cache.rowsInRange(store, from, to))
-    coverage = filterRows(cache.rowsInRange(store, from, to, true)).length
+    coverage = rows.length
+  }
+
+  // A `pending` row can sit on a page this scan no longer re-reads, so its
+  // status would freeze forever. Re-check such rows by id: bounded per scan,
+  // rate-limited per row, and skipped when a page fetch already saw them.
+  const stalePending = cache.pendingToRefresh(store, from, to)
+  if (stalePending.length > 0) {
+    const refreshed = []
+    for (let index = 0; index < stalePending.length; index += DETAIL_BATCH) {
+      const batch = stalePending.slice(index, index + DETAIL_BATCH)
+      const settled = await Promise.allSettled(batch.map(id => (
+        flight !== undefined
+          ? flight(`pending:${id}`, () => client.generation(id))
+          : client.generation(id)
+      )))
+      for (const result of settled) {
+        if (result.status !== 'fulfilled') continue
+        const record = result.value?.data ?? result.value
+        if (record !== null && typeof record === 'object') refreshed.push(normalizeGeneration(record))
+      }
+    }
+    cache.merge(store, refreshed)
+    cache.touchPending(store, stalePending)
+    cache.scheduleSave(fingerprint, store)
+    rows = filterRows(cache.rowsInRange(store, from, to))
+    coverage = rows.length
   }
 
   const actualTotal = rows.length
@@ -327,6 +356,9 @@ export function apply(ctx, config) {
 
   function clearCache() {
     cache.clear()
+    // «Обновить» must refresh everything the user can see, including stuck
+    // pending rows whose by-id re-check is still inside its rate limit.
+    historyCache.resetPendingChecks()
     // Keep an in-flight history walk joinable. Repeated "Обновить" clicks used
     // to clear this map and start another 146-page scan while the first one was
     // still running. Non-history work is safe to restart.
@@ -478,6 +510,9 @@ export function apply(ctx, config) {
       fromDate: query.period.fromDate,
       toDate: query.period.toDate,
     })
+    // The key rollups are unfiltered, so they cannot answer a filtered query;
+    // a filtered period falls back to the folded history sum.
+    const filtered = query.requestType !== undefined || query.status !== undefined || query.model !== undefined
     return {
       ...(summary ?? { balance: null, key: null, keyError: null, fetchedAt: null }),
       period: query.period,
@@ -487,7 +522,7 @@ export function apply(ctx, config) {
         model: query.model ?? null,
       },
       ...folded,
-      exactCost: exactCostFor(query.period.key, summary?.key ?? null),
+      exactCost: filtered ? null : exactCostFor(query.period.key, summary?.key ?? null),
       history: {
         scanned: history.scanned,
         total: history.total,
@@ -542,7 +577,9 @@ export function apply(ctx, config) {
     }
 
     if (forceFresh) cache.delete(cacheKey)
-    return await cached(cacheKey, Math.max(60_000, options.refreshSeconds * 1000), async () => {
+    // One refresh period, no floor: the panel's tick is the update schedule and
+    // must find this entry expired, so `refreshSeconds` is the real cadence.
+    return await cached(cacheKey, options.refreshSeconds * 1000, async () => {
       const [summary, history] = await Promise.all([
         loadSummary(),
         fetchHistory(client, {

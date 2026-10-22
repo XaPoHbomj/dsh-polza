@@ -37,19 +37,23 @@ export function useAsync(load, deps) {
 
 /**
  * Two-phase read: paint the cached answer immediately, then replace it with
- * the live one unless the cache is still fresh. The cache request never blocks
- * the fresh request for long, and both are aborted when the caller moves on.
+ * the live one. A refresh tick (same scope, new deps) always revalidates, so
+ * `refreshSeconds` is the real update period; a scope change or a fresh mount
+ * trusts a fresh cache answer and skips the live request.
  */
 export function useCachedAsync(loadCache, loadFresh, deps, resetKey = null) {
   const [state, setState] = useState({ data: null, error: null, loading: true, stale: false })
   const generation = useRef(0)
   const resetRef = useRef(resetKey)
+  const mountedRef = useRef(false)
 
   useEffect(() => {
     const current = generation.current + 1
     generation.current = current
     const shouldReset = resetRef.current !== resetKey
     resetRef.current = resetKey
+    const isRefreshTick = mountedRef.current && !shouldReset
+    mountedRef.current = true
     if (shouldReset) {
       setState({ data: null, error: null, loading: true, stale: false })
     } else {
@@ -83,7 +87,7 @@ export function useCachedAsync(loadCache, loadFresh, deps, resetKey = null) {
         if (!alive || generation.current !== current) return
         const source = data?.cache?.source
         if (source !== undefined && source !== 'none') {
-          const stale = data.cache.stale !== false
+          const stale = data.cache.stale !== false || isRefreshTick
           setState({ data, error: null, loading: stale, stale })
           if (!stale) {
             freshStarted = true
