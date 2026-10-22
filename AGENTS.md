@@ -112,17 +112,21 @@ build.mjs               esbuild wrapper for the lazy-CJS client bundle
 - Polza caps `meta.total` at 10 000 and `meta.totalPages` at 100. Pages beyond
   100 can still return rows. `fetchHistory` reads until a short or empty page
   (within `historyMaxPages`) and does not trust the reported total page count.
-  When the page cap grows since the last scan, it resumes past the pages the
-  store already holds instead of walking the range again.
+  When the page cap grows since the last scan, it resumes past the depth the
+  marker verified contiguously instead of walking the range again. Markers
+  record that contiguous depth and the failed-page count, and `partial` is
+  recomputed by any scan that actually walks the range — only a cache-answered
+  read trusts the marker's flag.
 - The table pagination also keeps “next” available while a full page is
   returned, so it can go past page 100.
 - The local cache assumes **completed and failed generations are immutable**.
   `pending` rows are mutable and revalidated: a page fetch counts as one check,
   and rows whose page is no longer re-read are re-checked by id (at most 25 per
-  scan, at most once per 2 minutes per row); `/refresh` clears that rate limit.
-  Pending rows take part in results and totals like any other row. If the
-  immutability assumption is ever wrong for a provider field, bump the cache
-  version or add a revalidation path.
+  scan, at most once per 2 minutes per row, scoped to the query's filters and
+  bounded by a 4 s response budget — late answers merge in the background);
+  `/refresh` clears that rate limit. Pending rows take part in results and
+  totals like any other row. If the immutability assumption is ever wrong for a
+  provider field, bump the cache version or add a revalidation path.
 
 ## Local cache
 
@@ -133,8 +137,9 @@ build.mjs               esbuild wrapper for the lazy-CJS client bundle
 - The cache stores normalized rows, query markers, and timestamps. It is
   bounded to 60 000 rows and 180 days, written atomically with mode `0600`.
 - A fresh page 1 is always fetched to pick up new rows; older pages come from
-  cache. A query marker records that a range was scanned to the end, so repeat
-  period switches skip the deep scan.
+  cache. A query marker records the contiguous page depth walked and the
+  failed-page count, so repeat period switches skip the deep scan and a resumed
+  walk can never skip a hole.
 - Saves for one fingerprint are chained and each write uses a unique temporary
   file, so concurrent saves can never interleave into one corrupt payload.
 - Cache failures are non-fatal: the plugin logs a warning and continues.

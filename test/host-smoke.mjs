@@ -44,6 +44,9 @@ let pendingDetail = {
 }
 
 let historyPageOneCalls = 0
+const pageCalls = new Map()
+const failingPages = new Set()
+let reportedTotal = 200
 globalThis.fetch = async input => {
   const url = new URL(String(input))
   if (url.pathname.endsWith('/v2/balance')) {
@@ -115,13 +118,21 @@ globalThis.fetch = async input => {
   if (url.pathname.endsWith('/v1/history/generations')) {
     const page = Number(url.searchParams.get('page') ?? '1')
     if (page === 1) historyPageOneCalls += 1
+    pageCalls.set(page, (pageCalls.get(page) ?? 0) + 1)
+    if (failingPages.has(page)) {
+      return new Response(JSON.stringify({ error: { message: 'page failed' } }), {
+        status: 503,
+        headers: { 'content-type': 'application/json', 'retry-after': '0' },
+      })
+    }
     const limit = Number(url.searchParams.get('limit') ?? '100')
     const start = (page - 1) * limit
     const items = rows.slice(start, start + limit)
     return new Response(JSON.stringify({
       items,
-      // Simulate Polza's metadata cap: pages beyond it still return rows.
-      meta: { page, limit, total: Math.min(rows.length, 200), totalPages: Math.min(Math.ceil(rows.length / limit), 2) },
+      // Simulate Polza's metadata caps: pages beyond the reported total still
+      // return rows. `reportedTotal` can also overstate what pages really hold.
+      meta: { page, limit, total: reportedTotal, totalPages: Math.min(Math.ceil(rows.length / limit), 2) },
     }), { status: 200, headers: { 'content-type': 'application/json' } })
   }
   return new Response(JSON.stringify({ error: { message: 'not found' } }), { status: 404 })
@@ -149,7 +160,8 @@ const ctx = {
 }
 
 let liveRefresh = 900
-apply(ctx, { historyMaxPages: 3, refreshSeconds: { get: () => liveRefresh } })
+let liveMaxPages = 3
+apply(ctx, { historyMaxPages: { get: () => liveMaxPages }, refreshSeconds: { get: () => liveRefresh } })
 
 function call(url, method = 'GET') {
   const req = { method, url, socket: { remoteAddress: '127.0.0.1' }, headers: {} }
@@ -302,6 +314,65 @@ const retried = await call('/polza/api/generation?id=gen_429')
 assert.equal(retried.status, 200)
 assert.equal(retried.body.id, 'gen_429', 'a rate-limited call is retried')
 assert.ok(Date.now() - retriedStartedAt >= 950, 'the retry honors Retry-After')
+
+// --- deepened resume: continue past the pages the marker verified --------
+liveMaxPages = 2
+reportedTotal = 400
+const thin = await call('/polza/api/overview?period=month&fresh=1&requestType=image')
+assert.equal(thin.status, 200)
+assert.equal(thin.body.history.partial, true, 'a page-capped scan reports partial')
+
+const monthPageTwo = pageCalls.get(2) ?? 0
+const monthPageThree = pageCalls.get(3) ?? 0
+liveMaxPages = 3
+const deepened = await call('/polza/api/overview?period=month&fresh=1&requestType=image')
+assert.equal(pageCalls.get(2) ?? 0, monthPageTwo, 'the resumed scan skips pages the marker verified')
+assert.equal(pageCalls.get(3) ?? 0, monthPageThree + 1, 'the resumed scan continues from the marker depth')
+assert.equal(deepened.body.history.partial, false, 'reaching the end clears partial')
+
+// --- a failed page marks the scan partial and the next walk heals it -----
+failingPages.add(2)
+liveMaxPages = 2
+reportedTotal = 400
+const broken = await call('/polza/api/overview?period=today&fresh=1&requestType=image')
+assert.equal(broken.body.history.partial, true, 'a failed page marks the scan partial')
+
+const todayPageTwo = pageCalls.get(2) ?? 0
+failingPages.clear()
+liveMaxPages = 3
+const healed = await call('/polza/api/overview?period=today&fresh=1&requestType=image')
+assert.equal(pageCalls.get(2) ?? 0, todayPageTwo + 1, 'the walk restarts at the hole')
+assert.equal(healed.body.history.partial, false, 'the successful walk clears partial')
+
+// --- a stuck partial flag clears when a later scan completes -------------
+failingPages.add(2)
+liveMaxPages = 3
+reportedTotal = 400
+await call('/polza/api/overview?period=7d&fresh=1&requestType=image')
+failingPages.clear()
+reportedTotal = 0 // no totals reported: the scan must walk and verify the end
+const unstuck = await call('/polza/api/overview?period=7d&fresh=1&requestType=image')
+assert.equal(unstuck.status, 200)
+assert.equal(unstuck.body.history.partial, false, 'a successful scan clears a stuck partial flag')
+
+// --- the marker stops at the first hole, so widening the cap re-reads it -
+rows.push(...Array.from({ length: 100 }, (_, index) => ({
+  ...rows[index],
+  id: `hole_${index}`,
+  createdAt: new Date(now - (300 + index) * 60_000).toISOString(),
+})))
+failingPages.add(2)
+liveMaxPages = 3
+reportedTotal = 400
+const holed = await call('/polza/api/overview?period=week&fresh=1&requestType=image')
+assert.equal(holed.body.history.partial, true, 'a hole keeps the scan partial')
+
+const weekPageTwo = pageCalls.get(2) ?? 0
+failingPages.clear()
+liveMaxPages = 4
+const repaired = await call('/polza/api/overview?period=week&fresh=1&requestType=image')
+assert.equal(pageCalls.get(2) ?? 0, weekPageTwo + 1, 'the verified depth stops at the hole, so the hole is re-read')
+assert.equal(repaired.body.history.partial, false, 'the repaired walk confirms the range')
 
 await new Promise(resolve => setTimeout(resolve, 700))
 rmSync(testHome, { recursive: true, force: true })

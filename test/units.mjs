@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import {
   addDays, aggregate, billingDate, billingStart, exactCostFor, normalizeGeneration, resolvePeriod,
 } from '../src/host/aggregate.js'
-import { HistoryCache, keyFingerprint } from '../src/host/cache.js'
+import { HistoryCache, historyQueryKey, keyFingerprint, RecencyMap } from '../src/host/cache.js'
 
 // --- aggregate.js: billing-day math -------------------------------------
 // Polza's billing day starts at 01:00 MSK = 22:00 UTC of the previous day.
@@ -74,6 +74,29 @@ assert.equal(fingerprint, keyFingerprint('pza_secret'), 'fingerprint is stable')
 assert.notEqual(fingerprint, keyFingerprint('pza_other'))
 assert.ok(!fingerprint.includes('pza'), 'fingerprint hides the key')
 
+// --- cache.js: marker identity and LRU map -------------------------------
+const range = { from: '2026-10-21T22:00:00.000Z', to: '2026-10-22T10:00:00.000Z' }
+assert.notEqual(
+  historyQueryKey({ ...range, periodKey: 'today' }),
+  historyQueryKey({ ...range, periodKey: 'custom' }),
+  'today and custom[today,today] keep separate markers',
+)
+assert.notEqual(
+  historyQueryKey({ ...range, periodKey: 'week', model: 'm' }),
+  historyQueryKey({ ...range, periodKey: 'week' }),
+  'filters are part of the marker identity',
+)
+assert.ok(historyQueryKey({ periodKey: 'all', from: null, to: range.to }).includes('|all|'), 'unbounded ranges key as all')
+
+const lru = new RecencyMap(2)
+lru.set('a', 1)
+lru.set('b', 2)
+assert.equal(lru.get('a'), 1, 'a read returns the value')
+lru.set('c', 3)
+assert.equal(lru.get('b'), undefined, 'the cold key is evicted first')
+assert.equal(lru.get('a'), 1, 'a touched key survives the eviction')
+assert.equal(lru.get('c'), 3)
+
 // --- cache.js: store primitives -----------------------------------------
 const testHome = join(process.cwd(), 'test/.tmp', `units-${Date.now()}-${Math.random().toString(16).slice(2)}`)
 mkdirSync(testHome, { recursive: true })
@@ -99,14 +122,20 @@ assert.equal(cache.rowsInRange(store, '2026-10-22T00:00:00.000Z', null).length, 
 assert.deepEqual(cache.pendingToRefresh(store, null, null), [], 'a fresh fetch counts as a pending check')
 cache.resetPendingChecks()
 assert.deepEqual(cache.pendingToRefresh(store, null, null), ['n2'], 'oldest pending first')
+assert.deepEqual(cache.pendingToRefresh(store, null, null, row => row.model === 'other'), [], 'keep narrows by query filters')
 cache.touchPending(store, ['n2'])
 assert.deepEqual(cache.pendingToRefresh(store, null, null), [], 'touch starts the rate limit')
+
+// rowsInRange returns store order; consumers that need a sequence re-sort.
+assert.deepEqual(cache.rowsInRange(store, null, null).map(entry => entry.id), ['n1', 'n2'], 'rows come back in store order')
 
 cache.markQuery(store, 'k', { total: 10, actualTotal: 10, maxPages: 5, pages: 5, ended: true, partial: false })
 const marker = cache.query(store, 'k')
 assert.equal(marker.ended, true)
 cache.markQuery(store, 'k', { total: 10, actualTotal: 10, maxPages: 5, pages: 5, ended: true, partial: false })
 assert.equal(cache.query(store, 'k'), marker, 'an identical fresh marker is not rewritten')
+cache.markQuery(store, 'k', { total: 10, actualTotal: 10, maxPages: 5, pages: 5, ended: true, partial: true, failedPages: 1 })
+assert.equal(cache.query(store, 'k').partial, true, 'a differing partial flag rewrites the marker')
 
 // --- cache.js: persistence ----------------------------------------------
 await cache.save(fingerprint, store)

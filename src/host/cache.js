@@ -28,6 +28,59 @@ export function keyFingerprint(value) {
   return createHash('sha256').update(String(value)).digest('hex').slice(0, 20)
 }
 
+/**
+ * Stable identity of one history scan: period, range, and filters. The period
+ * key is part of the identity on purpose: `today` and `custom[today,today]`
+ * cover slightly different instants and must not share one marker.
+ */
+export function historyQueryKey({ periodKey, from, to, requestType, status, model }) {
+  const fromPart = from === null || from === undefined ? 'all' : String(from).slice(0, 10)
+  return `${periodKey ?? ''}|${fromPart}|${String(to).slice(0, 10)}|${requestType ?? ''}|${status ?? ''}|${model ?? ''}`
+}
+
+/**
+ * Insertion-ordered map with least-recently-used eviction: reads move a key to
+ * the recency tail, so dropping the first key always drops the coldest one.
+ */
+export class RecencyMap {
+  constructor(limit) {
+    this.limit = limit
+    this.map = new Map()
+  }
+
+  get size() {
+    return this.map.size
+  }
+
+  /** Read one value and move its key to the recency tail. */
+  get(key) {
+    const value = this.map.get(key)
+    if (value === undefined) return undefined
+    this.map.delete(key)
+    this.map.set(key, value)
+    return value
+  }
+
+  set(key, value) {
+    if (this.map.has(key)) this.map.delete(key)
+    this.map.set(key, value)
+    while (this.map.size > this.limit) {
+      const oldest = this.map.keys().next().value
+      if (oldest === undefined) break
+      this.map.delete(oldest)
+    }
+    return this
+  }
+
+  delete(key) {
+    return this.map.delete(key)
+  }
+
+  clear() {
+    this.map.clear()
+  }
+}
+
 /** Cache directory under the harness home. */
 function cacheRoot() {
   const configured = process.env.DSH_HOME?.trim()
@@ -193,14 +246,16 @@ export class HistoryCache {
   /**
    * Ids of `pending` rows in one range that no page fetch or re-check has
    * refreshed recently, oldest first. Oldest rows are the most likely to have
-   * finished without their page being re-read.
+   * finished without their page being re-read. `keep` optionally narrows the
+   * rows to the calling query's filters.
    */
-  pendingToRefresh(store, from, to) {
+  pendingToRefresh(store, from, to, keep = null) {
     const [fromMs, toMs] = rangeMs(from, to)
     const cutoff = Date.now() - PENDING_RECHECK_MS
     const rows = []
     for (const row of store.rows.values()) {
       if (row.status !== 'pending') continue
+      if (keep !== null && !keep(row)) continue
       const at = timeOf(row)
       if (at === null || at < fromMs || at > toMs) continue
       if (Number(store.pendingChecks.get(String(row.id)) ?? 0) > cutoff) continue
@@ -234,7 +289,9 @@ export class HistoryCache {
       previous !== undefined
       && Number(previous.maxPages ?? 0) >= Number(marker.maxPages ?? 0)
       && previous.ended === marker.ended
+      && previous.partial === marker.partial
       && previous.actualTotal === marker.actualTotal
+      && Number(previous.failedPages ?? 0) === Number(marker.failedPages ?? 0)
       && Date.now() - Number(previous.at ?? 0) < 5 * 60_000
     ) return
     store.queries.set(key, { ...marker, at: Date.now() })

@@ -6,7 +6,7 @@
  */
 import z from '@deepseek-ai/schemastery'
 import { aggregate, exactCostFor, normalizeGeneration, resolvePeriod } from './aggregate.js'
-import { HistoryCache } from './cache.js'
+import { HistoryCache, historyQueryKey, RecencyMap } from './cache.js'
 import { asPolzaError, PolzaError, readInt, readString, sendError, sendJson } from './http.js'
 import { createPolzaClient, toNumber, toOptionalNumber } from './polza.js'
 
@@ -50,8 +50,18 @@ const DEFAULTS = {
 const KEY_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 const ROUTE_PREFIX_PATTERN = /^\/[A-Za-z0-9/_-]*$/
 
-// Concurrent by-id re-checks of stuck `pending` rows per upstream batch.
+// Concurrent by-id re-checks of stuck `pending` rows, and the total time the
+// response may wait for them; slower answers still land in the cache later.
 const DETAIL_BATCH = 5
+const RECHECK_BUDGET_MS = 4_000
+
+/** Resolve after one bounded wait without holding the process open. */
+function budgetExpired(ms) {
+  return new Promise(resolve => {
+    const timer = setTimeout(resolve, ms)
+    timer.unref?.()
+  })
+}
 
 /** Clamp one integer option. */
 function integer(value, fallback, min, max) {
@@ -179,9 +189,7 @@ async function fetchHistory(client, options, cache, control = {}) {
     sortBy: 'createdAt',
     sortOrder: 'desc',
   })
-  // The period key is part of the identity: `today` and `custom[today,today]`
-  // cover slightly different instants and must not share one marker.
-  const queryKey = `${periodKey ?? ''}|${from === null ? 'all' : String(from).slice(0, 10)}|${String(to).slice(0, 10)}|${requestType ?? ''}|${status ?? ''}|${model ?? ''}`
+  const queryKey = historyQueryKey({ periodKey, from, to, requestType, status, model })
 
   const fingerprint = await client.fingerprint()
   const store = await cache.open(fingerprint)
@@ -189,7 +197,12 @@ async function fetchHistory(client, options, cache, control = {}) {
   const markerFresh = marker !== undefined
     && Number(marker.maxPages ?? 0) >= maxPages
     && Date.now() - Number(marker.at ?? 0) < 24 * 60 * 60 * 1000
-  const markerComplete = markerFresh && (marker.ended === true || Number(marker.actualTotal ?? 0) > Number(marker.total ?? 0))
+  // A marker only counts as complete when its walk reached the end without
+  // page failures; a hole must keep the range looking unverified.
+  const markerComplete = markerFresh && (
+    (marker.ended === true && Number(marker.failedPages ?? 0) === 0)
+    || Number(marker.actualTotal ?? 0) > Number(marker.total ?? 0)
+  )
   let cacheRows = filterRows(cache.rowsInRange(store, from, to))
   let coverage = cacheRows.length
 
@@ -243,8 +256,10 @@ async function fetchHistory(client, options, cache, control = {}) {
   // A previous scan may have been cut short by a lower page cap (`/models`
   // reads a thin slice first; `historyMaxPages` can be raised). Its rows are
   // already in the store, so continue past them instead of walking the range
-  // again. New rows shift every page, so only resume when that shift still
-  // fits the always-fetched first page and the totals are not provider-capped.
+  // again. Resuming trusts only the marker's *contiguous* depth — a row count
+  // cannot prove that pages 1..N hold no holes after failed pages or pruning.
+  // New rows shift every page, so `deepened` also requires that shift to fit
+  // the always-fetched first page and the totals to be uncapped.
   const markerDepth = Number(marker?.pages ?? 0)
   const markerTotal = Number(marker?.total ?? 0)
   const shift = expectedTotal - markerTotal
@@ -253,19 +268,18 @@ async function fetchHistory(client, options, cache, control = {}) {
     && Number(marker.maxPages ?? 0) < maxPages
     && markerTotal > 0 && expectedTotal > 0 && expectedTotal < 10_000
     && shift >= 0 && shift < 100
-  const resumePage = capUnresolved && coverage >= needed
-    ? Math.max(2, Math.floor(needed / 100) + 1)
-    : deepened
-      ? Math.max(2, markerDepth + 1)
-      : 2
+  const resumePage = markerDepth > 1 && (deepened || (capUnresolved && coverage >= needed))
+    ? markerDepth + 1
+    : 2
 
+  // Page 1 is always fetched, so it always anchors the run; deeper pages join
+  // the contiguous walk only when they succeed.
+  const donePages = new Set([1])
   if (willFetch) {
     // Polza caps `meta.totalPages` at 100 even when more rows exist, so pages
     // are read until a short or empty page rather than trusting that field.
     // A verified cache only needs a thin refresh, so its request concurrency
     // drops. A cold cache, or one whose end is still unconfirmed, keeps 8.
-    // When 10 000 rows are already present and only the page-cap tail is
-    // unresolved, start at page 101 instead of walking the whole range again.
     let nextPage = resumePage
     while (nextPage <= maxPages && !reachedEnd) {
       const batch = []
@@ -274,20 +288,17 @@ async function fetchHistory(client, options, cache, control = {}) {
         nextPage += 1
       }
       const results = await Promise.allSettled(batch.map(page => client.generations(params(page))))
-      let batchItems = 0
-      let batchFailed = 0
-      for (const result of results) {
+      for (const [index, result] of results.entries()) {
         if (result.status === 'rejected') {
           failedPages += 1
-          batchFailed += 1
           continue
         }
         const items = Array.isArray(result.value?.items) ? result.value.items : []
-        batchItems += items.length
         if (items.length === 0) {
           reachedEnd = true
           continue
         }
+        donePages.add(batch[index])
         cache.merge(store, items.map(item => normalizeGeneration(item)))
         pagesFetched += 1
         if (items.length < 100) reachedEnd = true
@@ -299,40 +310,56 @@ async function fetchHistory(client, options, cache, control = {}) {
 
   // A `pending` row can sit on a page this scan no longer re-reads, so its
   // status would freeze forever. Re-check such rows by id: bounded per scan,
-  // rate-limited per row, and skipped when a page fetch already saw them.
-  const stalePending = cache.pendingToRefresh(store, from, to)
+  // rate-limited per row, scoped to this query's filters, and skipped when a
+  // page fetch already saw them. The response must not wait on slow detail
+  // calls — a budget bounds the wait and late answers merge into the store
+  // for the next read.
+  const stalePending = cache.pendingToRefresh(store, from, to, row => matchesFilters(row, filters))
   if (stalePending.length > 0) {
-    const refreshed = []
-    for (let index = 0; index < stalePending.length; index += DETAIL_BATCH) {
-      const batch = stalePending.slice(index, index + DETAIL_BATCH)
-      const settled = await Promise.allSettled(batch.map(id => (
-        flight !== undefined
+    let next = 0
+    const checkOne = async id => {
+      try {
+        const call = flight !== undefined
           ? flight(`pending:${id}`, () => client.generation(id))
           : client.generation(id)
-      )))
-      for (const result of settled) {
-        if (result.status !== 'fulfilled') continue
-        const record = result.value?.data ?? result.value
-        if (record !== null && typeof record === 'object') refreshed.push(normalizeGeneration(record))
+        const value = await call
+        const record = value?.data ?? value
+        if (record !== null && typeof record === 'object') {
+          cache.merge(store, [normalizeGeneration(record)])
+        }
+      } catch {
+        // A failed re-check is not fatal; its stamp keeps the retry rate sane.
+      } finally {
+        cache.touchPending(store, [id])
+        cache.scheduleSave(fingerprint, store)
       }
     }
-    cache.merge(store, refreshed)
-    cache.touchPending(store, stalePending)
-    cache.scheduleSave(fingerprint, store)
+    const workers = Array.from({ length: Math.min(DETAIL_BATCH, stalePending.length) }, async () => {
+      while (next < stalePending.length) {
+        const id = stalePending[next]
+        next += 1
+        await checkOne(id)
+      }
+    })
+    await Promise.race([Promise.all(workers), budgetExpired(RECHECK_BUDGET_MS)])
     rows = filterRows(cache.rowsInRange(store, from, to))
     coverage = rows.length
   }
 
-  // Depth walked contiguously so far: a resumed run starts past pages the
-  // store already holds, so a raw page count would understate it.
-  const scanDepth = Math.max(markerDepth, resumePage + pagesFetched - 2)
+  // Depth walked without holes: a failed page stops the run even when later
+  // pages succeed, so a future resume can never skip a missing page. A resumed
+  // run starts past the pages the marker verified, so it counts from there.
+  let contiguousDepth = resumePage - 1
+  while (donePages.has(contiguousDepth + 1)) contiguousDepth += 1
+  const scanDepth = Math.max(markerDepth, contiguousDepth)
   const actualTotal = rows.length
   const total = model !== undefined ? actualTotal : Math.max(expectedTotal, actualTotal)
-  const partial = markerFresh
-    ? Boolean(marker.partial)
-    : failedPages > 0
-      || (expectedTotal > 0 && coverage < needed && !reachedEnd)
-      || (!reachedEnd && scanDepth >= maxPages)
+  // `partial` describes the answer being returned: a scan that walked the
+  // range reports its own verdict, without a walk the marker's verdict stands.
+  // Either way, a later successful scan can clear a previously stuck flag.
+  const partial = willFetch
+    ? failedPages > 0 || (!reachedEnd && (coverage < needed || scanDepth >= maxPages))
+    : Boolean(marker?.partial)
 
   cache.markQuery(store, queryKey, {
     total: expectedTotal,
@@ -340,6 +367,7 @@ async function fetchHistory(client, options, cache, control = {}) {
     totalPages: reportedPages,
     maxPages,
     pages: scanDepth,
+    failedPages,
     // A page-1-only refresh must not erase a previously confirmed end.
     ended: reachedEnd || (!willFetch && marker?.ended === true),
     partial,
@@ -368,7 +396,7 @@ export function apply(ctx, config) {
   const initial = normalizeConfig(config)
   const routePrefix = initial.routePrefix
   const apiKeyRef = initial.apiKeyRef
-  const cache = new Map()
+  const cache = new RecencyMap(80)
   const flights = new Map()
   const historyCache = new HistoryCache(ctx.logger)
 
@@ -428,18 +456,9 @@ export function apply(ctx, config) {
     timeoutMs: initial.requestTimeoutMs,
   })
 
-  /** Move one memory-cache entry to the recency tail, or return undefined. */
-  function touch(key) {
-    const hit = cache.get(key)
-    if (hit === undefined) return undefined
-    cache.delete(key)
-    cache.set(key, hit)
-    return hit
-  }
-
   /** Read-through cache with a small bound; eviction is least-recently-used. */
   async function cached(key, ttlMs, load) {
-    const hit = touch(key)
+    const hit = cache.get(key)
     const now = Date.now()
     if (hit !== undefined) {
       if (hit.expires > now) {
@@ -461,10 +480,6 @@ export function apply(ctx, config) {
     }
     const value = await once(key, load)
     cache.set(key, { value, expires: Date.now() + ttlMs, createdAt: Date.now() })
-    if (cache.size > 80) {
-      const oldest = cache.keys().next().value
-      if (oldest !== undefined) cache.delete(oldest)
-    }
     return value
   }
 
@@ -572,7 +587,7 @@ export function apply(ctx, config) {
     const cacheKey = `overview:${query.period.key}:${query.period.fromDate ?? 'all'}:${query.period.toDate}:${query.requestType ?? ''}:${query.status ?? ''}:${query.model ?? ''}:${options.historyMaxPages}`
 
     if (cacheOnly) {
-      const memory = touch(cacheKey)
+      const memory = cache.get(cacheKey)
       if (memory !== undefined) {
         return {
           ...memory.value,
