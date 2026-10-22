@@ -114,7 +114,10 @@ build.mjs               esbuild wrapper for the lazy-CJS client bundle
   (within `historyMaxPages`) and does not trust the reported total page count.
   When the page cap grows since the last scan, it resumes past the depth the
   marker verified contiguously instead of walking the range again. Markers
-  record that contiguous depth and the failed-page count, and `partial` is
+  record that contiguous depth, the failed-page count, and a hole-retry clock;
+  a marker with failed pages is retried at most once a minute and `/refresh`
+  zeroes that clock, so the button always re-opens a holed range. A range
+  counts as complete only when its walk had no failed pages, and `partial` is
   recomputed by any scan that actually walks the range — only a cache-answered
   read trusts the marker's flag.
 - The table pagination also keeps “next” available while a full page is
@@ -122,11 +125,12 @@ build.mjs               esbuild wrapper for the lazy-CJS client bundle
 - The local cache assumes **completed and failed generations are immutable**.
   `pending` rows are mutable and revalidated: a page fetch counts as one check,
   and rows whose page is no longer re-read are re-checked by id (at most 25 per
-  scan, at most once per 2 minutes per row, scoped to the query's filters and
-  bounded by a 4 s response budget — late answers merge in the background);
-  `/refresh` clears that rate limit. Pending rows take part in results and
-  totals like any other row. If the immutability assumption is ever wrong for a
-  provider field, bump the cache version or add a revalidation path.
+  scan, at most once per 2 minutes per row, scoped to the query's *stable*
+  filters — request type and model, never status — and bounded by a 4 s
+  response budget; late answers merge in the background); `/refresh` clears
+  that rate limit. Pending rows take part in results and totals like any other
+  row. If the immutability assumption is ever wrong for a provider field, bump
+  the cache version or add a revalidation path.
 
 ## Local cache
 

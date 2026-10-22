@@ -55,6 +55,9 @@ const ROUTE_PREFIX_PATTERN = /^\/[A-Za-z0-9/_-]*$/
 const DETAIL_BATCH = 5
 const RECHECK_BUDGET_MS = 4_000
 
+// How often a marker with unfilled holes may trigger a retry walk.
+const HOLE_RETRY_MS = 60_000
+
 /** Resolve after one bounded wait without holding the process open. */
 function budgetExpired(ms) {
   return new Promise(resolve => {
@@ -197,12 +200,12 @@ async function fetchHistory(client, options, cache, control = {}) {
   const markerFresh = marker !== undefined
     && Number(marker.maxPages ?? 0) >= maxPages
     && Date.now() - Number(marker.at ?? 0) < 24 * 60 * 60 * 1000
-  // A marker only counts as complete when its walk reached the end without
-  // page failures; a hole must keep the range looking unverified.
-  const markerComplete = markerFresh && (
-    (marker.ended === true && Number(marker.failedPages ?? 0) === 0)
-    || Number(marker.actualTotal ?? 0) > Number(marker.total ?? 0)
-  )
+  // A marker only counts as complete when its walk reached the end (or walked
+  // past the provider-capped total) AND left no failed pages behind; a hole
+  // must keep the range looking unverified either way.
+  const markerComplete = markerFresh
+    && Number(marker.failedPages ?? 0) === 0
+    && (marker.ended === true || Number(marker.actualTotal ?? 0) > Number(marker.total ?? 0))
   let cacheRows = filterRows(cache.rowsInRange(store, from, to))
   let coverage = cacheRows.length
 
@@ -250,25 +253,32 @@ async function fetchHistory(client, options, cache, control = {}) {
   const tolerance = Math.min(100, Math.floor(needed * 0.05))
   const approximatelyCovered = needed > 0 && coverage >= needed - tolerance
   const capUnresolved = reportedPages >= 100 && maxPages > 100 && !markerComplete
-  const willFetch = needed === 0 || capUnresolved || (!markerFresh && !approximatelyCovered)
+  // A marker with unfilled holes is retried on its own clock: at most once per
+  // HOLE_RETRY_MS, and «Обновить» zeroes that clock via `resetHoleRetries`.
+  const holeRetryDue = marker !== undefined
+    && Number(marker.failedPages ?? 0) > 0
+    && Date.now() - Number(marker.holeAt ?? marker.at ?? 0) >= HOLE_RETRY_MS
+  const willFetch = needed === 0 || capUnresolved || holeRetryDue || (!markerFresh && !approximatelyCovered)
   const cacheSufficient = markerFresh && !capUnresolved
   const batchSize = cacheSufficient ? 2 : 8
   // A previous scan may have been cut short by a lower page cap (`/models`
-  // reads a thin slice first; `historyMaxPages` can be raised). Its rows are
-  // already in the store, so continue past them instead of walking the range
-  // again. Resuming trusts only the marker's *contiguous* depth — a row count
-  // cannot prove that pages 1..N hold no holes after failed pages or pruning.
-  // New rows shift every page, so `deepened` also requires that shift to fit
-  // the always-fetched first page and the totals to be uncapped.
+  // reads a thin slice first; `historyMaxPages` can be raised) or left a hole
+  // on a failed page. Its verified rows are already in the store, so continue
+  // past them instead of walking the range again. Resuming trusts only the
+  // marker's *contiguous* depth — a row count cannot prove that pages 1..N
+  // hold no holes after failed pages or pruning. New rows shift every page, so
+  // resuming also requires that shift to fit the always-fetched first page and
+  // the totals to be uncapped.
   const markerDepth = Number(marker?.pages ?? 0)
   const markerTotal = Number(marker?.total ?? 0)
   const shift = expectedTotal - markerTotal
+  const shiftSafe = markerTotal > 0 && expectedTotal > 0 && expectedTotal < 10_000
+    && shift >= 0 && shift < 100
   const deepened = marker !== undefined
     && marker.ended !== true
     && Number(marker.maxPages ?? 0) < maxPages
-    && markerTotal > 0 && expectedTotal > 0 && expectedTotal < 10_000
-    && shift >= 0 && shift < 100
-  const resumePage = markerDepth > 1 && (deepened || (capUnresolved && coverage >= needed))
+    && shiftSafe
+  const resumePage = markerDepth > 1 && ((shiftSafe && (deepened || holeRetryDue)) || (capUnresolved && coverage >= needed))
     ? markerDepth + 1
     : 2
 
@@ -314,7 +324,10 @@ async function fetchHistory(client, options, cache, control = {}) {
   // page fetch already saw them. The response must not wait on slow detail
   // calls — a budget bounds the wait and late answers merge into the store
   // for the next read.
-  const stalePending = cache.pendingToRefresh(store, from, to, row => matchesFilters(row, filters))
+  // Scope re-checks by the query's *stable* fields only: `status` is exactly
+  // what may change under us, so a `status=completed` query must still be the
+  // one that learns a pending row has finished.
+  const stalePending = cache.pendingToRefresh(store, from, to, row => matchesFilters(row, { requestType, model }))
   if (stalePending.length > 0) {
     let next = 0
     const checkOne = async id => {
@@ -347,11 +360,12 @@ async function fetchHistory(client, options, cache, control = {}) {
   }
 
   // Depth walked without holes: a failed page stops the run even when later
-  // pages succeed, so a future resume can never skip a missing page. A resumed
-  // run starts past the pages the marker verified, so it counts from there.
+  // pages succeed, so a future resume can never skip a missing page. When the
+  // walk really ran from page 2, an older marker's depth is superseded by what
+  // this walk verified — only a cache-answered read keeps the old depth.
   let contiguousDepth = resumePage - 1
   while (donePages.has(contiguousDepth + 1)) contiguousDepth += 1
-  const scanDepth = Math.max(markerDepth, contiguousDepth)
+  const scanDepth = willFetch ? contiguousDepth : Math.max(markerDepth, contiguousDepth)
   const actualTotal = rows.length
   const total = model !== undefined ? actualTotal : Math.max(expectedTotal, actualTotal)
   // `partial` describes the answer being returned: a scan that walked the
@@ -361,13 +375,21 @@ async function fetchHistory(client, options, cache, control = {}) {
     ? failedPages > 0 || (!reachedEnd && (coverage < needed || scanDepth >= maxPages))
     : Boolean(marker?.partial)
 
+  const effectiveFailedPages = willFetch
+    ? failedPages
+    : Number(marker?.failedPages ?? 0)
   cache.markQuery(store, queryKey, {
     total: expectedTotal,
     actualTotal,
     totalPages: reportedPages,
     maxPages,
     pages: scanDepth,
-    failedPages,
+    failedPages: effectiveFailedPages,
+    // Only a scan that reaches the end clears the cooldown; a cache-answered
+    // read must preserve the marker's hole state.
+    holeAt: willFetch
+      ? (effectiveFailedPages > 0 ? Date.now() : 0)
+      : Number(marker?.holeAt ?? 0),
     // A page-1-only refresh must not erase a previously confirmed end.
     ended: reachedEnd || (!willFetch && marker?.ended === true),
     partial,
@@ -408,6 +430,9 @@ export function apply(ctx, config) {
     // «Обновить» must refresh everything the user can see, including stuck
     // pending rows whose by-id re-check is still inside its rate limit.
     historyCache.resetPendingChecks()
+    // «Обновить» must also re-open ranges whose walk left holes: zeroing their
+    // retry clock makes the very next scan walk the hole again.
+    historyCache.resetHoleRetries()
     // Keep an in-flight history walk joinable. Repeated "Обновить" clicks used
     // to clear this map and start another 146-page scan while the first one was
     // still running. Non-history work is safe to restart.

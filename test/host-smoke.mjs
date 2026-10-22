@@ -47,6 +47,19 @@ let historyPageOneCalls = 0
 const pageCalls = new Map()
 const failingPages = new Set()
 let reportedTotal = 200
+let reportedTotalPages = 2
+let pending2Calls = 0
+let pending2Detail = {
+  id: 'gen_pending2',
+  model: 'model/a',
+  modelDisplayName: 'Model A',
+  requestType: 'chat',
+  provider: 'test',
+  status: 'pending',
+  clientCost: '0.30',
+  usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+  createdAt: new Date(now - 220 * 60_000).toISOString(),
+}
 globalThis.fetch = async input => {
   const url = new URL(String(input))
   if (url.pathname.endsWith('/v2/balance')) {
@@ -69,6 +82,10 @@ globalThis.fetch = async input => {
       usage_weekly: 25,
       usage_monthly: 60,
     }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  if (url.pathname.endsWith('/v1/history/generations/gen_pending2')) {
+    pending2Calls += 1
+    return new Response(JSON.stringify(pending2Detail), { status: 200, headers: { 'content-type': 'application/json' } })
   }
   if (url.pathname.endsWith('/v1/history/generations/gen_pending')) {
     pendingDetailCalls += 1
@@ -132,7 +149,7 @@ globalThis.fetch = async input => {
       items,
       // Simulate Polza's metadata caps: pages beyond the reported total still
       // return rows. `reportedTotal` can also overstate what pages really hold.
-      meta: { page, limit, total: reportedTotal, totalPages: Math.min(Math.ceil(rows.length / limit), 2) },
+      meta: { page, limit, total: reportedTotal, totalPages: reportedTotalPages },
     }), { status: 200, headers: { 'content-type': 'application/json' } })
   }
   return new Response(JSON.stringify({ error: { message: 'not found' } }), { status: 404 })
@@ -373,6 +390,88 @@ liveMaxPages = 4
 const repaired = await call('/polza/api/overview?period=week&fresh=1&requestType=image')
 assert.equal(pageCalls.get(2) ?? 0, weekPageTwo + 1, 'the verified depth stops at the hole, so the hole is re-read')
 assert.equal(repaired.body.history.partial, false, 'the repaired walk confirms the range')
+
+// --- a hole outranks the actualTotal > total heuristic -------------------
+rows.splice(220, 0, ...Array.from({ length: 40 }, (_, index) => ({
+  id: `embed_${index}`,
+  model: 'model/a',
+  modelDisplayName: 'Model A',
+  requestType: 'embed',
+  provider: 'test',
+  status: 'completed',
+  cost: '0.05',
+  usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+  createdAt: new Date(now - (200 + index) * 60_000).toISOString(),
+})))
+reportedTotalPages = 100
+reportedTotal = 20
+liveMaxPages = 150
+failingPages.add(2)
+const holeScan = await call('/polza/api/overview?period=month&fresh=1&requestType=embed')
+assert.equal(holeScan.body.history.partial, true, 'a hole keeps the scan partial')
+
+failingPages.clear()
+const cappedHeal = await call('/polza/api/overview?period=month&fresh=1&requestType=embed')
+assert.equal(cappedHeal.body.history.partial, false, 'a hole outranks the actualTotal > total completeness guess')
+
+// --- «Обновить» re-opens a range whose walk left a hole -----------------
+reportedTotalPages = 2
+reportedTotal = 200
+liveMaxPages = 3
+failingPages.add(2)
+await call('/polza/api/overview?period=7d&fresh=1&requestType=embed')
+
+const holePageTwo = pageCalls.get(2) ?? 0
+failingPages.clear()
+await call('/polza/api/refresh')
+const refreshedHole = await call('/polza/api/overview?period=7d&fresh=1&requestType=embed')
+assert.equal(refreshedHole.status, 200)
+assert.equal(pageCalls.get(2) ?? 0, holePageTwo + 1, 'refresh retries the hole at the same page cap')
+
+// --- a fresh re-walk supersedes an old marker's depth --------------------
+reportedTotal = 400
+liveMaxPages = 3
+await call('/polza/api/overview?period=week&fresh=1&requestType=embed') // healthy depth 3
+
+failingPages.add(2)
+reportedTotal = 600
+liveMaxPages = 4
+const rewalk = await call('/polza/api/overview?period=week&fresh=1&requestType=embed')
+assert.equal(rewalk.body.history.partial, true, 'a re-walk that hits a hole reports partial')
+
+const rewalkPageTwo = pageCalls.get(2) ?? 0
+failingPages.clear()
+await call('/polza/api/refresh')
+const rewalkHealed = await call('/polza/api/overview?period=week&fresh=1&requestType=embed')
+assert.equal(pageCalls.get(2) ?? 0, rewalkPageTwo + 1, 'an old depth is not trusted after a re-walk, so the hole is re-read')
+assert.equal(rewalkHealed.body.history.partial, false)
+
+// --- pending re-checks run for status filters too ------------------------
+rows.splice(250, 0, {
+  ...rows[0],
+  id: 'gen_pending2',
+  model: 'model/a',
+  modelDisplayName: 'Model A',
+  requestType: 'chat',
+  status: 'pending',
+  cost: '0.30',
+  createdAt: new Date(now - 220 * 60_000).toISOString(),
+})
+reportedTotalPages = 100
+reportedTotal = 150
+liveMaxPages = 150
+await call('/polza/api/overview?period=month&status=completed&model=model/a&fresh=1') // merges the deep row
+pending2Detail = { ...pending2Detail, status: 'completed', clientCost: '0.55' }
+await call('/polza/api/refresh')
+
+const completedView = await call('/polza/api/overview?period=month&status=completed&model=model/a&fresh=1')
+assert.equal(completedView.status, 200)
+assert.equal(pending2Calls, 1, 'a completed-only query still re-checks pending rows')
+
+const settledPending2 = await call('/polza/api/generations?period=month&model=model/a&limit=100&cache=1')
+const settled2 = settledPending2.body.items.find(item => item.id === 'gen_pending2')
+assert.equal(settled2.status, 'completed', 'the re-check lands in the cached row')
+assert.equal(settled2.cost, 0.55)
 
 await new Promise(resolve => setTimeout(resolve, 700))
 rmSync(testHome, { recursive: true, force: true })

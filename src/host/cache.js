@@ -277,6 +277,23 @@ export class HistoryCache {
     for (const store of this.stores.values()) store.pendingChecks.clear()
   }
 
+  /** Clear the failed-page cooldown so the next scans retry holes immediately. */
+  resetHoleRetries() {
+    for (const [fingerprint, store] of this.stores) {
+      let changed = false
+      for (const marker of store.queries.values()) {
+        if (Number(marker.failedPages ?? 0) > 0 && marker.holeAt !== 0) {
+          marker.holeAt = 0
+          changed = true
+        }
+      }
+      if (changed) {
+        store.dirty = true
+        this.scheduleSave(fingerprint, store)
+      }
+    }
+  }
+
   /** One completed page-range marker for a period/filter combination. */
   query(store, key) {
     return store.queries.get(key)
@@ -288,10 +305,12 @@ export class HistoryCache {
     if (
       previous !== undefined
       && Number(previous.maxPages ?? 0) >= Number(marker.maxPages ?? 0)
+      && Number(previous.pages ?? 0) === Number(marker.pages ?? 0)
       && previous.ended === marker.ended
       && previous.partial === marker.partial
       && previous.actualTotal === marker.actualTotal
       && Number(previous.failedPages ?? 0) === Number(marker.failedPages ?? 0)
+      && Number(previous.holeAt ?? 0) === Number(marker.holeAt ?? 0)
       && Date.now() - Number(previous.at ?? 0) < 5 * 60_000
     ) return
     store.queries.set(key, { ...marker, at: Date.now() })

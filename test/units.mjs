@@ -136,6 +136,8 @@ cache.markQuery(store, 'k', { total: 10, actualTotal: 10, maxPages: 5, pages: 5,
 assert.equal(cache.query(store, 'k'), marker, 'an identical fresh marker is not rewritten')
 cache.markQuery(store, 'k', { total: 10, actualTotal: 10, maxPages: 5, pages: 5, ended: true, partial: true, failedPages: 1 })
 assert.equal(cache.query(store, 'k').partial, true, 'a differing partial flag rewrites the marker')
+cache.markQuery(store, 'k', { total: 10, actualTotal: 10, maxPages: 5, pages: 7, ended: true, partial: true, failedPages: 1 })
+assert.equal(cache.query(store, 'k').pages, 7, 'a differing depth rewrites the marker')
 
 // --- cache.js: persistence ----------------------------------------------
 await cache.save(fingerprint, store)
