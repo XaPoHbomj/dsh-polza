@@ -26,14 +26,14 @@ globalThis.fetch = async input => {
     return json({ ok: true, ref: 'POLZA_API_KEY', configured: true, source: 'file', writable: true, config: { refreshSeconds: 60, lowBalanceThreshold: 100, criticalBalanceThreshold: 20, historyMaxPages: 30 } })
   }
   if (url.pathname.endsWith('/summary')) {
-    return json({ balance: { amount: 1250, available: 1240, reservedAmount: 10, spentAmount: 900, updatedAt: new Date().toISOString() }, key: { label: 'pza_test••••0000', limit: 10, limitRemaining: 7.5, limitReset: 'monthly', usage: 100, usageDaily: 3, usageWeekly: 25, usageMonthly: 60 }, keyError: null, fetchedAt: new Date().toISOString() })
+    return json({ balance: { amount: 1250, available: 1240, reservedAmount: 1, spentAmount: 900, updatedAt: new Date().toISOString() }, key: { label: 'pza_test••••0000', limit: 10, limitRemaining: 7.5, limitReset: 'monthly', usage: 100, usageDaily: 3, usageWeekly: 25, usageMonthly: 60 }, keyError: null, fetchedAt: new Date().toISOString() })
   }
   if (url.pathname.endsWith('/models')) {
     return json({ items: [{ key: 'model/a', label: 'Model A', requests: 10, cost: 5 }], partial: false })
   }
   if (url.pathname.endsWith('/overview')) {
     return json({
-      balance: { amount: 1250, available: 1240, reservedAmount: 10, spentAmount: 900, updatedAt: new Date().toISOString() },
+      balance: { amount: 1250, available: 1240, reservedAmount: 1, spentAmount: 900, updatedAt: new Date().toISOString() },
       key: { label: 'pza_test••••0000', limit: 10, limitRemaining: 7.5, limitReset: 'monthly', usage: 100, usageDaily: 3, usageWeekly: 25, usageMonthly: 60 },
       keyError: null,
       period: { key: 'week', from: '2026-10-19T22:00:00.000Z', to: '2026-10-21T10:00:00.000Z', fromDate: '2026-10-19', toDate: '2026-10-21' },
@@ -44,6 +44,7 @@ globalThis.fetch = async input => {
       types: [{ key: 'chat', ...{ cost: 12.5, requests: 25, promptTokens: 1, completionTokens: 1, totalTokens: 2, cachedTokens: 0, reasoningTokens: 0, averageCost: 0.5 } }],
       statuses: [],
       exactCost: { cost: 25, source: 'usage_weekly' },
+      periodCost: 23.5,
       history: { scanned: 25, total: 25, partial: false, pages: 1, totalPages: 1, maxPages: 30 },
       fetchedAt: new Date().toISOString(),
     })
@@ -105,6 +106,7 @@ const text = document.getElementById('root').textContent
 assert.ok(text.includes('Polza'), 'panel title')
 assert.ok(text.includes('Доступно к трате'), 'kpi')
 assert.ok(/1\s?240/.test(text), 'available amount')
+assert.ok(/23,50/.test(text), 'period cost excludes the reservation')
 assert.ok(text.includes('Model A'), 'model breakdown')
 assert.ok(text.includes('История генераций'), 'table title')
 assert.ok(text.includes('Лимит ключа'), 'key limit block')
@@ -128,6 +130,8 @@ await sleep(80)
 const chip = document.querySelector('.polza-chip')
 assert.ok(chip !== null, 'chip rendered')
 assert.ok(chip.textContent.includes('за день'), 'chip day spend line')
+assert.ok(/1\s?250/.test(chip.textContent), 'chip shows the wallet balance')
+assert.ok(chip.textContent.includes('2,00'), 'chip day spend excludes the reservation')
 chip.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
 assert.equal(opened, 1)
 

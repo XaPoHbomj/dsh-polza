@@ -46,15 +46,20 @@ export function BalanceChip({ wide = true, openPanel }) {
   const summary = useAsync(signal => api.summary({ signal }), [tick])
 
   const balance = summary.data?.balance ?? null
-  const available = balance?.available
+  const current = balance?.amount
+  const reserved = balance?.reservedAmount
   const daySpend = summary.data?.key?.usageDaily
+  // The cabinet's "траты за сегодня" is the key rollup minus reservation holds.
+  const spentToday = daySpend === undefined
+    ? undefined
+    : Math.max(0, daySpend - (typeof reserved === 'number' && Number.isFinite(reserved) ? reserved : 0))
   const thresholds = health.data?.config ?? { lowBalanceThreshold: 100, criticalBalanceThreshold: 20 }
-  const tone = balanceTone(available, thresholds.lowBalanceThreshold, thresholds.criticalBalanceThreshold)
-  const label = available === undefined
+  const tone = balanceTone(current, thresholds.lowBalanceThreshold, thresholds.criticalBalanceThreshold)
+  const label = current === undefined
     ? 'Polza'
-    : (daySpend === undefined
-        ? `Polza: доступно ${money(available)}`
-        : `Polza: доступно ${money(available)}, расход за день ${money(daySpend)}`)
+    : (spentToday === undefined
+        ? `Polza: баланс ${money(current)}`
+        : `Polza: баланс ${money(current)}, расход за день ${money(spentToday)}`)
 
   return (
     <button
@@ -70,10 +75,10 @@ export function BalanceChip({ wide = true, openPanel }) {
       {wide && (
         <span className="polza-chip-text">
           <span className="polza-chip-amount">
-            {available === undefined ? 'Polza' : money(available)}
+            {current === undefined ? 'Polza' : money(current)}
           </span>
-          {daySpend !== undefined && (
-            <span className="polza-chip-sub">за день {money(daySpend)}</span>
+          {spentToday !== undefined && (
+            <span className="polza-chip-sub">за день {money(spentToday)}</span>
           )}
         </span>
       )}
@@ -440,7 +445,9 @@ export function PolzaPanel() {
   const key = data?.key ?? null
   const totals = data?.totals ?? null
   const exact = data?.exactCost ?? null
-  const periodCost = exact !== null ? exact.cost : (totals?.cost ?? 0)
+  // Settled spend: the host already subtracts reservation holds (or drops
+  // pending rows in the folded fallback), so the card matches the cabinet.
+  const periodCost = data?.periodCost ?? (totals?.cost ?? 0)
   const thresholds = health.data?.config ?? { lowBalanceThreshold: 100, criticalBalanceThreshold: 20 }
   const tone = balanceTone(balance?.available, thresholds.lowBalanceThreshold, thresholds.criticalBalanceThreshold)
   const promptTokens = totals?.promptTokens ?? 0
@@ -450,14 +457,14 @@ export function PolzaPanel() {
   const exactNote = exact === null
     ? (data?.history?.partial
         ? `по ${amount(data.history.scanned)} из ${amount(data.history.total)} записей`
-        : (filtered ? 'по истории с учётом фильтров' : 'по истории ключа'))
+        : (filtered ? 'по истории с учётом фильтров, без резервации' : 'по истории, без резервации'))
     : (exact.source === 'usage_daily'
-        ? 'точно за сегодня'
+        ? 'точно за сегодня, без резервации'
         : exact.source === 'usage_weekly'
-          ? 'точно за неделю, с понедельника'
+          ? 'точно за неделю с понедельника, без резервации'
           : exact.source === 'usage_monthly'
-            ? 'точно за месяц'
-            : 'точно за всё время')
+            ? 'точно за месяц, без резервации'
+            : 'точно за всё время, без резервации')
 
   // `/models` does one cold page-1 read and can take seconds. The overview
   // already carries the models for the selected period, so the filter can

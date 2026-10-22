@@ -109,6 +109,11 @@ build.mjs               esbuild wrapper for the lazy-CJS client bundle
   a period; charts and breakdowns fold history rows. The exact total is
   suppressed when request/status/model filters are active, because the key
   rollups cannot answer a filtered query.
+- Money figures are settled ("без учёта резервации", matching the Polza
+  cabinet): the sidebar chip shows the wallet `amount`, not `available`, and
+  day/period spend is the key rollup minus `reservedAmount` (the folded
+  fallback skips `pending` rows). Polza folds in-flight reservation holds into
+  both the rollups and `available`, so they must be subtracted.
 - Polza caps `meta.total` at 10 000 and `meta.totalPages` at 100. Pages beyond
   100 can still return rows. `fetchHistory` reads until a short or empty page
   (within `historyMaxPages`) and does not trust the reported total page count.
@@ -166,8 +171,8 @@ curl -s "http://127.0.0.1:3080/polza/api/overview?period=month" | python3 -m jso
 
 Check in the Web GUI:
 
-1. Sidebar chip shows the available balance with kopecks and changes tone when
-   thresholds are crossed.
+1. Sidebar chip shows the wallet balance and the day's settled spend with
+   kopecks and changes tone when thresholds are crossed.
 2. Polza panel opens, chart and table load, filters narrow the table.
 3. Hovering a history row shows token and cost-line breakdown.
 4. Plugins → `dsh-polza` shows the settings card; save a field and verify it
