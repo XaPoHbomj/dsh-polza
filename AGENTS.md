@@ -111,9 +111,10 @@ build.mjs               esbuild wrapper for the lazy-CJS client bundle
   rollups cannot answer a filtered query.
 - Money figures are settled ("без учёта резервации", matching the Polza
   cabinet): the sidebar chip shows the wallet `amount`, not `available`, and
-  day/period spend is the key rollup minus `reservedAmount` (the folded
-  fallback skips `pending` rows). Polza folds in-flight reservation holds into
-  both the rollups and `available`, so they must be subtracted.
+  day/period spend is the key rollup minus `reservedAmount`. History folds are
+  settled money too — `aggregate.add` drops pending costs — while request and
+  token counters include every row. Polza folds in-flight reservation holds
+  into both the rollups and `available`, so they must be subtracted.
 - Polza caps `meta.total` at 10 000 and `meta.totalPages` at 100. Pages beyond
   100 can still return rows. `fetchHistory` reads until a short or empty page
   (within `historyMaxPages`) and does not trust the reported total page count.

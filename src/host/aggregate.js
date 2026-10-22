@@ -111,9 +111,13 @@ function bucket() {
   return { cost: 0, requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, reasoningTokens: 0 }
 }
 
-/** Fold one normalized row into one bucket. */
+/**
+ * Fold one normalized row into one bucket. Money is settled money: a pending
+ * row is a reservation hold, so it counts as a request and carries its tokens,
+ * but its cost lands in the buckets only once the generation settles.
+ */
 function add(bucketValue, row) {
-  bucketValue.cost += row.cost
+  if (row.status !== 'pending') bucketValue.cost += row.cost
   bucketValue.requests += 1
   bucketValue.promptTokens += row.usage.promptTokens
   bucketValue.completionTokens += row.usage.completionTokens

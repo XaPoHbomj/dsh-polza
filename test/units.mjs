@@ -56,6 +56,13 @@ assert.equal(folded.days[0].requests, 1, '22:30 UTC belongs to the next billing 
 assert.equal(folded.days[1].requests, 2)
 assert.equal(folded.models.length, 2)
 
+const withPending = [...rows, row('p', '2026-10-22T09:00:00.000Z', { status: 'pending', cost: 9 })]
+const foldedPending = aggregate(withPending, { fromDate: '2026-10-21', toDate: '2026-10-22' })
+assert.equal(foldedPending.totals.cost, 1.5, 'money is settled: a pending cost is only a hold')
+assert.equal(foldedPending.totals.requests, 4, 'requests still count pending rows')
+assert.equal(foldedPending.days[1].cost, 1, 'the day bar shows settled money')
+assert.equal(foldedPending.days[1].requests, 3, 'the day bar still counts the pending request')
+
 const many = Array.from({ length: 10 }, (_, index) => row(`m${index}`, '2026-10-22T08:00:00.000Z', { model: `model-${index}` }))
 const foldedMany = aggregate(many, {})
 assert.equal(foldedMany.models.length, 9, 'top 8 models plus one other bucket')

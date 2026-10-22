@@ -586,14 +586,12 @@ export function apply(ctx, config) {
     // Money figures show settled spend only: Polza folds in-flight reservation
     // holds into the balance and the usage rollups (the cabinet displays
     // `usage - reserved` and the wallet amount), and the panel must match it.
+    // History folds are settled too — `add()` skips pending costs — so the
+    // chart and the breakdowns agree with this number.
     const exactCost = filtered ? null : exactCostFor(query.period.key, summary?.key ?? null)
     const reserved = Number(summary?.balance?.reservedAmount)
     const reservedNow = Number.isFinite(reserved) ? reserved : 0
-    const settledCost = history.rows.reduce(
-      (sum, row) => (row.status === 'pending' ? sum : sum + row.cost),
-      0,
-    )
-    const periodCost = Math.max(0, exactCost === null ? settledCost : exactCost.cost - reservedNow)
+    const periodCost = Math.max(0, exactCost === null ? folded.totals.cost : exactCost.cost - reservedNow)
     return {
       ...(summary ?? { balance: null, key: null, keyError: null, fetchedAt: null }),
       period: query.period,
