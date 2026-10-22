@@ -47,9 +47,14 @@ export function BalanceChip({ wide = true, openPanel }) {
 
   const balance = summary.data?.balance ?? null
   const available = balance?.available
+  const daySpend = summary.data?.key?.usageDaily
   const thresholds = health.data?.config ?? { lowBalanceThreshold: 100, criticalBalanceThreshold: 20 }
   const tone = balanceTone(available, thresholds.lowBalanceThreshold, thresholds.criticalBalanceThreshold)
-  const label = available === undefined ? 'Polza' : `Polza: доступно ${money(available)}`
+  const label = available === undefined
+    ? 'Polza'
+    : (daySpend === undefined
+        ? `Polza: доступно ${money(available)}`
+        : `Polza: доступно ${money(available)}, расход за день ${money(daySpend)}`)
 
   return (
     <button
@@ -63,8 +68,13 @@ export function BalanceChip({ wide = true, openPanel }) {
     >
       <PolzaMark size={wide ? 17 : 19} />
       {wide && (
-        <span className="polza-chip-amount">
-          {available === undefined ? 'Polza' : money(available)}
+        <span className="polza-chip-text">
+          <span className="polza-chip-amount">
+            {available === undefined ? 'Polza' : money(available)}
+          </span>
+          {daySpend !== undefined && (
+            <span className="polza-chip-sub">за день {money(daySpend)}</span>
+          )}
         </span>
       )}
       <span className="polza-chip-dot" aria-hidden="true" />
@@ -251,6 +261,7 @@ function GenerationHoverCard({ item, rect }) {
 
       <div className="polza-hover-divider" />
       <div className="polza-hover-row polza-hover-total"><span>Итого</span><b>{preciseMoney(cost)}</b></div>
+      <div className="polza-hover-muted">{item.id}</div>
       <div className="polza-hover-muted">{item.modelDisplayName ?? item.model} · {timestamp(item.createdAt)}</div>
     </div>,
     document.body,
@@ -299,18 +310,19 @@ function GenerationsTable({ data, loading, error, page, limit, sortBy, sortOrder
                 Стоимость {sortBy === 'clientCost' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
               </th>
               <th>Статус</th>
+              <th className="polza-hide-sm">ID</th>
             </tr>
           </thead>
           <tbody>
             {loading && items.length === 0 ? (
               Array.from({ length: 6 }, (_, index) => (
                 <tr key={`skeleton-${index}`}>
-                  <td colSpan={6}><div className="polza-skeleton" style={{ height: 18 }} /></td>
+                  <td colSpan={7}><div className="polza-skeleton" style={{ height: 18 }} /></td>
                 </tr>
               ))
             ) : items.length === 0 ? (
               <tr>
-                <td colSpan={6}>
+                <td colSpan={7}>
                   <div className="polza-empty" style={{ height: 120 }}>
                     <PolzaMark size={24} />
                     <span>Нет генераций за выбранный период</span>
@@ -331,6 +343,7 @@ function GenerationsTable({ data, loading, error, page, limit, sortBy, sortOrder
                   {preciseMoney(item.cost)}
                 </td>
                 <td><span className="polza-status" data-status={item.status}>{statusLabel(item.status)}</span></td>
+                <td className="polza-cell-id polza-hide-sm" title={item.id}>{item.id}</td>
               </tr>
             ))}
           </tbody>

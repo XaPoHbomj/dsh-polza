@@ -22,6 +22,8 @@ const CSS = `
 .polza-chip:focus-visible { outline: 2px solid var(--dsw-focus-ring-color, #4d6bfe); outline-offset: 1px; }
 .polza-chip[data-wide="false"] { justify-content: center; padding: 0; width: 36px; }
 .polza-chip-amount { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--dsw-alias-label-primary, #111); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.polza-chip-text { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; min-width: 0; flex: 1 1 auto; }
+.polza-chip-sub { font-size: 10px; line-height: 1.2; color: var(--dsw-alias-label-tertiary, #777); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
 .polza-chip[data-tone="warn"] .polza-chip-amount { color: var(--dsw-alias-state-warn-primary, #b26a00); }
 .polza-chip[data-tone="critical"] .polza-chip-amount { color: var(--dsw-alias-state-error-primary, #c62828); }
 .polza-chip-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dsw-alias-state-success-primary, #2e7d32); flex: none; }
@@ -137,6 +139,7 @@ const CSS = `
 .polza-table tr:last-child td { border-bottom: 0; }
 .polza-table tbody tr:hover td { background: var(--dsw-alias-interactive-bg-hover, rgba(0,0,0,.03)); }
 .polza-cell-time { white-space: nowrap; color: var(--dsw-alias-label-secondary, #555); font-variant-numeric: tabular-nums; }
+.polza-cell-id { max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--dsw-font-markdown-code-font-family, ui-monospace, monospace); font-size: 11px; color: var(--dsw-alias-label-tertiary, #777); }
 .polza-cell-model { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .polza-cell-money { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .polza-cell-tokens { text-align: right; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary, #555); white-space: nowrap; }

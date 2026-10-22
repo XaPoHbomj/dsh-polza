@@ -112,6 +112,7 @@ const limitSelect = document.querySelector('.polza-panel-head .polza-select')
 assert.ok(limitSelect !== null, 'limit select')
 assert.ok([...limitSelect.options].every(option => option.value !== ''), 'no empty limit option')
 assert.ok(text.includes('0,18137669'), 'precise per-request cost')
+assert.ok(text.includes('gen_1'), 'generation id column')
 
 const row = document.querySelector('.polza-table tbody tr')
 row.dispatchEvent(new dom.window.MouseEvent('mouseover', { bubbles: true }))
@@ -126,6 +127,7 @@ chipRoot.render(React.createElement(BalanceChip, { wide: true, openPanel: () => 
 await sleep(80)
 const chip = document.querySelector('.polza-chip')
 assert.ok(chip !== null, 'chip rendered')
+assert.ok(chip.textContent.includes('за день'), 'chip day spend line')
 chip.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
 assert.equal(opened, 1)
 
