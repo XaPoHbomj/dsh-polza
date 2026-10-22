@@ -174,7 +174,11 @@ export class HistoryCache {
     prunePendingChecks(store)
   }
 
-  /** Rows inside one ISO range, newest first. */
+  /**
+   * Rows inside one ISO range, in store order. Callers that need a sequence
+   * sort it themselves (the table re-sorts by its own key anyway), so scans
+   * over a 60 000-row store stay linear.
+   */
   rowsInRange(store, from, to) {
     const [fromMs, toMs] = rangeMs(from, to)
     const rows = []
@@ -183,7 +187,6 @@ export class HistoryCache {
       if (at === null || at < fromMs || at > toMs) continue
       rows.push(row)
     }
-    rows.sort((a, b) => (timeOf(b) ?? 0) - (timeOf(a) ?? 0))
     return rows
   }
 

@@ -74,7 +74,8 @@ function unwrap(value) {
 
 /** Normalize the Loader row's config into one resolved shape. */
 function normalizeConfig(config) {
-  const input = unwrap(config) !== null && typeof unwrap(config) === 'object' ? unwrap(config) : {}
+  const unwrapped = unwrap(config)
+  const input = unwrapped !== null && typeof unwrapped === 'object' ? unwrapped : {}
   const read = name => unwrap(input[name])
   const apiKeyRefRaw = read('apiKeyRef')
   const apiKeyRef = typeof apiKeyRefRaw === 'string' && KEY_REF_PATTERN.test(apiKeyRefRaw.trim())
@@ -163,7 +164,7 @@ function matchesFilters(row, { requestType, status, model }) {
  * `flight` collapses concurrent page-1 requests for the same query.
  */
 async function fetchHistory(client, options, cache, control = {}) {
-  const { from, to, requestType, status, model, maxPages } = options
+  const { from, to, requestType, status, model, maxPages, periodKey } = options
   const cacheOnly = control.cacheOnly === true
   const flight = control.flight
   const filters = { requestType, status, model }
@@ -178,7 +179,9 @@ async function fetchHistory(client, options, cache, control = {}) {
     sortBy: 'createdAt',
     sortOrder: 'desc',
   })
-  const queryKey = `${from === null ? 'all' : String(from).slice(0, 10)}|${String(to).slice(0, 10)}|${requestType ?? ''}|${status ?? ''}|${model ?? ''}`
+  // The period key is part of the identity: `today` and `custom[today,today]`
+  // cover slightly different instants and must not share one marker.
+  const queryKey = `${periodKey ?? ''}|${from === null ? 'all' : String(from).slice(0, 10)}|${String(to).slice(0, 10)}|${requestType ?? ''}|${status ?? ''}|${model ?? ''}`
 
   const fingerprint = await client.fingerprint()
   const store = await cache.open(fingerprint)
@@ -237,9 +240,24 @@ async function fetchHistory(client, options, cache, control = {}) {
   const willFetch = needed === 0 || capUnresolved || (!markerFresh && !approximatelyCovered)
   const cacheSufficient = markerFresh && !capUnresolved
   const batchSize = cacheSufficient ? 2 : 8
+  // A previous scan may have been cut short by a lower page cap (`/models`
+  // reads a thin slice first; `historyMaxPages` can be raised). Its rows are
+  // already in the store, so continue past them instead of walking the range
+  // again. New rows shift every page, so only resume when that shift still
+  // fits the always-fetched first page and the totals are not provider-capped.
+  const markerDepth = Number(marker?.pages ?? 0)
+  const markerTotal = Number(marker?.total ?? 0)
+  const shift = expectedTotal - markerTotal
+  const deepened = marker !== undefined
+    && marker.ended !== true
+    && Number(marker.maxPages ?? 0) < maxPages
+    && markerTotal > 0 && expectedTotal > 0 && expectedTotal < 10_000
+    && shift >= 0 && shift < 100
   const resumePage = capUnresolved && coverage >= needed
     ? Math.max(2, Math.floor(needed / 100) + 1)
-    : 2
+    : deepened
+      ? Math.max(2, markerDepth + 1)
+      : 2
 
   if (willFetch) {
     // Polza caps `meta.totalPages` at 100 even when more rows exist, so pages
@@ -305,20 +323,23 @@ async function fetchHistory(client, options, cache, control = {}) {
     coverage = rows.length
   }
 
+  // Depth walked contiguously so far: a resumed run starts past pages the
+  // store already holds, so a raw page count would understate it.
+  const scanDepth = Math.max(markerDepth, resumePage + pagesFetched - 2)
   const actualTotal = rows.length
   const total = model !== undefined ? actualTotal : Math.max(expectedTotal, actualTotal)
   const partial = markerFresh
     ? Boolean(marker.partial)
     : failedPages > 0
       || (expectedTotal > 0 && coverage < needed && !reachedEnd)
-      || (!reachedEnd && pagesFetched >= maxPages)
+      || (!reachedEnd && scanDepth >= maxPages)
 
   cache.markQuery(store, queryKey, {
     total: expectedTotal,
     actualTotal,
     totalPages: reportedPages,
     maxPages,
-    pages: markerFresh ? Number(marker.pages ?? pagesFetched) : pagesFetched,
+    pages: scanDepth,
     // A page-1-only refresh must not erase a previously confirmed end.
     ended: reachedEnd || (!willFetch && marker?.ended === true),
     partial,
@@ -407,9 +428,18 @@ export function apply(ctx, config) {
     timeoutMs: initial.requestTimeoutMs,
   })
 
-  /** Read-through cache with a small bound. */
-  async function cached(key, ttlMs, load) {
+  /** Move one memory-cache entry to the recency tail, or return undefined. */
+  function touch(key) {
     const hit = cache.get(key)
+    if (hit === undefined) return undefined
+    cache.delete(key)
+    cache.set(key, hit)
+    return hit
+  }
+
+  /** Read-through cache with a small bound; eviction is least-recently-used. */
+  async function cached(key, ttlMs, load) {
+    const hit = touch(key)
     const now = Date.now()
     if (hit !== undefined) {
       if (hit.expires > now) {
@@ -542,7 +572,7 @@ export function apply(ctx, config) {
     const cacheKey = `overview:${query.period.key}:${query.period.fromDate ?? 'all'}:${query.period.toDate}:${query.requestType ?? ''}:${query.status ?? ''}:${query.model ?? ''}:${options.historyMaxPages}`
 
     if (cacheOnly) {
-      const memory = cache.get(cacheKey)
+      const memory = touch(cacheKey)
       if (memory !== undefined) {
         return {
           ...memory.value,
@@ -559,6 +589,7 @@ export function apply(ctx, config) {
       const history = await fetchHistory(client, {
         from: query.period.from,
         to: query.period.to,
+        periodKey: query.period.key,
         requestType: query.requestType,
         status: query.status,
         model: query.model,
@@ -585,6 +616,7 @@ export function apply(ctx, config) {
         fetchHistory(client, {
           from: query.period.from,
           to: query.period.to,
+          periodKey: query.period.key,
           requestType: query.requestType,
           status: query.status,
           model: query.model,
@@ -605,6 +637,7 @@ export function apply(ctx, config) {
       const history = await fetchHistory(client, {
         from: period.from,
         to: period.to,
+        periodKey: period.key,
         maxPages: Math.min(options.historyMaxPages, 10),
       }, historyCache, { flight: once })
       const seen = new Map()
@@ -663,6 +696,7 @@ export function apply(ctx, config) {
       const history = await fetchHistory(client, {
         from: query.period.from,
         to: query.period.to,
+        periodKey: query.period.key,
         requestType: query.requestType,
         status: query.status,
         model: query.model,
@@ -684,12 +718,13 @@ export function apply(ctx, config) {
       const history = await fetchHistory(client, {
         from: query.period.from,
         to: query.period.to,
+        periodKey: query.period.key,
         requestType: query.requestType,
         status: query.status,
         model: query.model,
         maxPages: options.historyMaxPages,
       }, historyCache, { flight: once })
-      return pageOf(history.rows, 'cache', history.partial)
+      return pageOf(history.rows, 'disk', history.partial)
     }
 
     const flightKey = `generations:${query.period.fromDate ?? 'all'}:${query.period.toDate}:${query.requestType ?? ''}:${query.status ?? ''}:${page}:${limit}:${sortBy}:${sortOrder}`

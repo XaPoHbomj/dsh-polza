@@ -2,8 +2,11 @@
  * Minimal Polza.ai API client. The API key only ever reaches this module's
  * Authorization header; it is never logged, returned, or echoed in failures.
  */
+import { createRequire } from 'node:module'
 import { keyFingerprint } from './cache.js'
 import { PolzaError } from './http.js'
+
+const { version: packageVersion } = createRequire(import.meta.url)('../../package.json')
 
 const RETRYABLE = new Set([429, 500, 502, 503, 504])
 
@@ -25,6 +28,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+/** Honor one Retry-After header, capped so a single route call cannot hang. */
+function retryAfterMs(response) {
+  const raw = response.headers?.get?.('retry-after')
+  if (raw === null || raw === undefined || raw === '') return null
+  const seconds = Number(raw)
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 10_000)
+  const at = Date.parse(raw)
+  return Number.isFinite(at) ? Math.min(Math.max(0, at - Date.now()), 10_000) : null
+}
+
 /** Map an HTTP status onto the public failure vocabulary. */
 function failureFor(status, message, traceId) {
   if (status === 401) return new PolzaError('polza/unauthorized', 'Polza отклонила API-ключ (401)', { status, traceId })
@@ -32,6 +45,9 @@ function failureFor(status, message, traceId) {
   if (status === 403) return new PolzaError('polza/forbidden', 'Ключу запрещён доступ к этому ресурсу (403)', { status, traceId })
   if (status === 404) return new PolzaError('polza/not-found', 'Ресурс Polza не найден (404)', { status, traceId })
   if (status === 429) return new PolzaError('polza/rate-limited', 'Polza просит снизить частоту запросов (429)', { status, traceId })
+  if (status === 502 || status === 503 || status === 504) {
+    return new PolzaError('polza/unavailable', message || `Polza временно недоступна (${status})`, { status: 502, traceId })
+  }
   return new PolzaError('polza/upstream', message || `Polza ответила ошибкой ${status}`, { status: 502, traceId })
 }
 
@@ -57,7 +73,7 @@ export function createPolzaClient({ baseUrl, resolveKey, timeoutMs }) {
           headers: {
             Authorization: `Bearer ${resolved.value}`,
             Accept: 'application/json',
-            'User-Agent': 'dsh-polza/0.1',
+            'User-Agent': `dsh-polza/${packageVersion}`,
           },
           signal: AbortSignal.timeout(timeoutMs),
         })
@@ -76,7 +92,7 @@ export function createPolzaClient({ baseUrl, resolveKey, timeoutMs }) {
           )
           if (RETRYABLE.has(response.status) && attempt < 2) {
             lastFailure = failure
-            await sleep(300 * (attempt + 1) + Math.floor(Math.random() * 120))
+            await sleep(retryAfterMs(response) ?? 300 * (attempt + 1) + Math.floor(Math.random() * 120))
             continue
           }
           throw failure

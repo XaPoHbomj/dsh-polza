@@ -3,7 +3,7 @@
  * responses, and the real route handler. Run with `node test/host-smoke.mjs`.
  */
 import assert from 'node:assert/strict'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { apply } from '../src/host/index.js'
 
@@ -30,6 +30,7 @@ const rows = Array.from({ length: 250 }, (_, index) => ({
 const pendingCreatedAt = new Date(now - 150 * 60_000).toISOString()
 rows[150] = { ...rows[150], id: 'gen_pending', status: 'pending', cost: '0.10' }
 let pendingDetailCalls = 0
+let gen429Calls = 0
 let pendingDetail = {
   id: 'gen_pending',
   model: 'model/a',
@@ -69,6 +70,30 @@ globalThis.fetch = async input => {
   if (url.pathname.endsWith('/v1/history/generations/gen_pending')) {
     pendingDetailCalls += 1
     return new Response(JSON.stringify(pendingDetail), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  if (url.pathname.endsWith('/v1/history/generations/gen_503')) {
+    return new Response(JSON.stringify({ error: { message: 'upstream down' } }), {
+      status: 503,
+      headers: { 'content-type': 'application/json', 'retry-after': '0' },
+    })
+  }
+  if (url.pathname.endsWith('/v1/history/generations/gen_429')) {
+    gen429Calls += 1
+    if (gen429Calls === 1) {
+      return new Response(JSON.stringify({ error: { message: 'slow down' } }), {
+        status: 429,
+        headers: { 'content-type': 'application/json', 'retry-after': '1' },
+      })
+    }
+    return new Response(JSON.stringify({
+      id: 'gen_429',
+      model: 'model/a',
+      requestType: 'chat',
+      status: 'completed',
+      clientCost: '0.10',
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      createdAt: new Date(now).toISOString(),
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
   }
   if (/\/v1\/history\/generations\/gen_/.test(url.pathname)) {
     return new Response(JSON.stringify({
@@ -267,7 +292,19 @@ const filteredOverview = await call('/polza/api/overview?period=week&model=model
 assert.equal(filteredOverview.status, 200)
 assert.equal(filteredOverview.body.exactCost, null, 'model filters also suppress the exact cost')
 
+// --- failure vocabulary and Retry-After ---------------------------------
+const unavailable = await call('/polza/api/generation?id=gen_503')
+assert.equal(unavailable.status, 502)
+assert.equal(unavailable.body.error.code, 'polza/unavailable', 'upstream outages keep their own error code')
+
+const retriedStartedAt = Date.now()
+const retried = await call('/polza/api/generation?id=gen_429')
+assert.equal(retried.status, 200)
+assert.equal(retried.body.id, 'gen_429', 'a rate-limited call is retried')
+assert.ok(Date.now() - retriedStartedAt >= 950, 'the retry honors Retry-After')
+
 await new Promise(resolve => setTimeout(resolve, 700))
+rmSync(testHome, { recursive: true, force: true })
 
 console.log('[host-smoke] ok:', {
   period: overview.body.period.key,

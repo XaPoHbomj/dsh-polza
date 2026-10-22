@@ -38,7 +38,7 @@
   "scripts": {
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
-    "test": "node test/host-smoke.mjs && node test/render.mjs && node test/dom.mjs",
+    "test": "node test/host-smoke.mjs && node test/units.mjs && node test/render.mjs && node test/dom.mjs",
     "prepublishOnly": "node build.mjs"
   },
   "devDependencies": {

@@ -112,6 +112,8 @@ build.mjs               esbuild wrapper for the lazy-CJS client bundle
 - Polza caps `meta.total` at 10 000 and `meta.totalPages` at 100. Pages beyond
   100 can still return rows. `fetchHistory` reads until a short or empty page
   (within `historyMaxPages`) and does not trust the reported total page count.
+  When the page cap grows since the last scan, it resumes past the pages the
+  store already holds instead of walking the range again.
 - The table pagination also keeps “next” available while a full page is
   returned, so it can go past page 100.
 - The local cache assumes **completed and failed generations are immutable**.
